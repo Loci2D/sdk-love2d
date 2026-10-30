@@ -2,8 +2,44 @@ local socket = require("socket")
 local pb = nil
 local protoc = nil
 
-package.cpath = package.cpath .. ";./?.so;./lib/?.so;sdks/love2d/lib/?.so;../../sdks/love2d/lib/?.so"
-package.path = package.path .. ";./?.lua;./lib/?.lua;sdks/love2d/lib/?.lua;../../sdks/love2d/lib/?.lua"
+-- Discover directory of current script to locate adjacent 'lib/' folder
+local script_dir = ""
+local info = debug.getinfo(1, "S")
+if info and info.source and info.source:sub(1, 1) == "@" then
+    local src_path = info.source:sub(2)
+    script_dir = src_path:match("^(.*[/\\])") or ""
+end
+
+local cpath_candidates = {
+    script_dir .. "lib/?.so",
+    script_dir .. "lib/?.dylib",
+    script_dir .. "lib/?.dll",
+    script_dir .. "?.so",
+    script_dir .. "?.dylib",
+    script_dir .. "?.dll",
+    "./?.so", "./lib/?.so", "./loci2d/lib/?.so", "./client/loci2d/lib/?.so",
+    "./?.dylib", "./lib/?.dylib", "./loci2d/lib/?.dylib", "./client/loci2d/lib/?.dylib",
+    "./?.dll", "./lib/?.dll", "./loci2d/lib/?.dll", "./client/loci2d/lib/?.dll",
+    "sdks/love2d/lib/?.so", "../../sdks/love2d/lib/?.so"
+}
+for _, pat in ipairs(cpath_candidates) do
+    if not package.cpath:find(pat, 1, true) then
+        package.cpath = package.cpath .. ";" .. pat
+    end
+end
+
+local path_candidates = {
+    script_dir .. "lib/?.lua",
+    script_dir .. "?.lua",
+    "./?.lua", "./lib/?.lua", "./loci2d/lib/?.lua", "./client/loci2d/lib/?.lua",
+    "./loci2d/?.lua", "./client/loci2d/?.lua",
+    "sdks/love2d/lib/?.lua", "../../sdks/love2d/lib/?.lua"
+}
+for _, pat in ipairs(path_candidates) do
+    if not package.path:find(pat, 1, true) then
+        package.path = package.path .. ";" .. pat
+    end
+end
 
 -- Attempt to load lua-protobuf library and protoc parser
 local ok_pb, res_pb = pcall(require, "pb")
@@ -92,7 +128,9 @@ end
 -- Loci Client Module Facade
 -- ============================================================================
 loci = {
-    -- State
+    -- Metadata
+    VERSION = "0.6.1",
+    COMPATIBLE_ENGINE_VERSION = "0.6.x",
     SCHEMA_VERSION = 1,
     entities = {},
     globals = {},
@@ -151,11 +189,15 @@ function loci.connect(host, port, player_name, base_path, tick_rate)
         local candidate_proto_paths = {
             loci._base_path and (loci._base_path .. "game_packets.proto"),
             loci._base_path and (loci._base_path .. "/game_packets.proto"),
+            script_dir ~= "" and (script_dir .. "lib/game_packets.proto") or nil,
+            script_dir ~= "" and (script_dir .. "game_packets.proto") or nil,
+            "lib/game_packets.proto",
+            "loci2d/lib/game_packets.proto",
+            "client/loci2d/lib/game_packets.proto",
             "sdks/love2d/lib/game_packets.proto",
             "../../sdks/love2d/lib/game_packets.proto",
             "proto/game_packets.proto",
             "../../proto/game_packets.proto",
-            "lib/game_packets.proto",
             "game_packets.proto",
         }
 
@@ -177,7 +219,7 @@ function loci.connect(host, port, player_name, base_path, tick_rate)
         -- 1. Try dynamic text parsing with protoc.lua
         if protoc then
             local p = protoc.new()
-            p.include_dirs = { loci._base_path, "sdks/love2d/lib", "proto", "../../proto", "." }
+            p.include_dirs = { loci._base_path, script_dir .. "lib", "lib", "loci2d/lib", "client/loci2d/lib", "sdks/love2d/lib", "proto", "../../proto", "." }
 
             for _, path in ipairs(candidate_proto_paths) do
                 local content = read_proto_file(path)
@@ -195,9 +237,14 @@ function loci.connect(host, port, player_name, base_path, tick_rate)
         if not schema_loaded then
             local candidate_pb_paths = {
                 loci._base_path and (loci._base_path .. "game_packets.pb"),
+                loci._base_path and (loci._base_path .. "/game_packets.pb"),
+                script_dir ~= "" and (script_dir .. "lib/game_packets.pb") or nil,
+                script_dir ~= "" and (script_dir .. "game_packets.pb") or nil,
+                "lib/game_packets.pb",
+                "loci2d/lib/game_packets.pb",
+                "client/loci2d/lib/game_packets.pb",
                 "sdks/love2d/lib/game_packets.pb",
                 "../../sdks/love2d/lib/game_packets.pb",
-                "lib/game_packets.pb",
                 "game_packets.pb",
             }
             for _, path in ipairs(candidate_pb_paths) do
@@ -253,14 +300,12 @@ function loci.send_move(dir_x, dir_y)
     loci._send_intent({ move = { direction = { x_bits = float_to_bits(dir_x), y_bits = float_to_bits(dir_y) } } })
 end
 
-function loci.send_action(ability_id, aim_x, aim_y)
-    local my_ent = loci.get_my_entity()
-    if not my_ent then return end
-    
-    local dx = aim_x - my_ent.x
-    local dy = aim_y - my_ent.y
+function loci.send_action(ability_id, dir_x, dir_y)
+    local aid = tonumber(ability_id) or 0
+    local dx = tonumber(dir_x) or 0
+    local dy = tonumber(dir_y) or 0
     local len = math.sqrt(dx * dx + dy * dy)
-    
+
     if len > 0 then
         dx = dx / len
         dy = dy / len
@@ -268,8 +313,21 @@ function loci.send_action(ability_id, aim_x, aim_y)
         dx = 0
         dy = 0
     end
-    
-    loci._send_intent({ action = { ability_id = ability_id, target_direction = { x_bits = float_to_bits(dx), y_bits = float_to_bits(dy) } } })
+
+    loci._send_intent({ action = { ability_id = aid, target_direction = { x_bits = float_to_bits(dx), y_bits = float_to_bits(dy) } } })
+end
+
+function loci.send_action_at_position(ability_id, aim_x, aim_y)
+    local my_ent = loci.get_my_entity()
+    if not my_ent then return end
+
+    local dx = (tonumber(aim_x) or 0) - (my_ent.x or 0)
+    local dy = (tonumber(aim_y) or 0) - (my_ent.y or 0)
+    loci.send_action(ability_id, dx, dy)
+end
+
+function loci.send_action_direction(ability_id, dir_x, dir_y)
+    loci.send_action(ability_id, dir_x, dir_y)
 end
 
 -- Cached to avoid GC pressure, returns a pooled shallow copy to prevent internal cache mutation

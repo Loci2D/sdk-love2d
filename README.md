@@ -9,7 +9,7 @@ The **Loci2D Love2D SDK** (`loci_client.lua`) is a high-level abstraction layer 
 ## SDK Directory Structure
 
 ```text
-sdks/love2d/
+sdk-love2d/
 ├── loci_client.lua        # Main client module (API Facade, State Manager, and Netcode)
 ├── test_sdk.lua           # Unit test suite to validate the SDK locally
 ├── AI_REFERENCE.md        # Compact API reference formatted for LLMs / AI Agents
