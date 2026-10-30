@@ -32,7 +32,7 @@ jobs:
       - name: Build Native lua-protobuf (pb.so)
         run: |
           echo "=== Compiling native pb.so ==="
-          gcc -O2 -shared -fPIC -I/usr/include/lua5.1 lib/src/pb.c -o lib/pb.so
+          gcc -O2 -shared -fPIC -Ilib/src/include lib/src/pb.c -o lib/pb.so
           ls -la lib/pb.so
 
       - name: Test Native C Extension (pb.so)
