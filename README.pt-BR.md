@@ -49,7 +49,7 @@ Se você já executou o script de verificação na raiz (`./tools/setup_environm
 Antes de rodar seu jogo no Love2D, você pode validar a integridade de todas as abstrações (metatabelas de `Entity`, conversão tipada de propriedades, consultas em raio e despacho de eventos) executando:
 
 ```bash
-lua sdks/love2d/test_sdk.lua
+lua test_sdk.lua
 ```
 
 Se o ambiente estiver correto, você verá a mensagem:
@@ -63,12 +63,12 @@ All loci_client.lua SDK unit tests passed successfully!
 
 ```lua
 -- main.lua
-package.path = package.path .. ";sdks/love2d/?.lua"
+package.path = package.path .. ";./loci2d/?.lua;./?.lua"
 local loci = require("loci_client")
 
 function love.load()
     -- Conecta ao servidor autoritativo
-    loci.connect("127.0.0.1", 8080, "Player1", "sdks/love2d/lib/")
+    loci.connect("127.0.0.1", 8080, "Player1")
 
     loci.on_action_cast = function(entity, ability_id, dir_x, dir_y)
         print("Habilidade disparada por entidade:", entity.id)
@@ -104,4 +104,4 @@ function love.quit()
 end
 ```
 
-Consulte a documentação completa em `sdks/love2d/docs/index.html` abrindo no seu navegador.
+Consulte a documentação completa em `docs/index.html` abrindo no seu navegador.
