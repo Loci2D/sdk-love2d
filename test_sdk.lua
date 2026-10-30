@@ -1,8 +1,8 @@
 -- Test suite for loci_client.lua (Love2D Client SDK)
 -- Validates Entity metatable, auto-casting, helpers, and packet handling.
 
-package.path = package.path .. ";./sdks/love2d/?.lua;./sdks/love2d/lib/?.lua;./?.lua;./lib/?.lua"
-package.cpath = package.cpath .. ";/usr/local/lib/lua/5.1/?.so;./sdks/love2d/lib/?.so;./lib/?.so"
+package.path = package.path .. ";./?.lua;./lib/?.lua"
+package.cpath = package.cpath .. ";./lib/?.so;./lib/?.dylib;./lib/?.dll;./?.so;./?.dylib;./?.dll;/usr/local/lib/lua/5.1/?.so"
 
 local loci = require("loci_client")
 
@@ -108,5 +108,39 @@ assert(globals["mode"] == "3v3_arena", "globals.mode should be string")
 -- Test server response rejection feedback
 loci._handle_response({ status = "rejected: Stunned" })
 assert(intent_rejected_called, "on_intent_rejected must be triggered")
+
+-- Test version metadata
+assert(loci.VERSION == "0.6.1", "loci.VERSION should be 0.6.1")
+assert(loci.COMPATIBLE_ENGINE_VERSION == "0.6.x", "loci.COMPATIBLE_ENGINE_VERSION should be 0.6.x")
+
+-- Test action helpers & position-to-direction conversion
+local last_sent_intent = nil
+loci._send_intent = function(intent)
+    last_sent_intent = intent
+end
+
+-- 1. send_action with numeric direction
+loci.send_action(1, 10, 0)
+assert(last_sent_intent and last_sent_intent.action, "action intent must be sent")
+assert(last_sent_intent.action.ability_id == 1, "ability_id must be 1")
+assert(last_sent_intent.action.target_direction.x_bits == 65536, "normalized dx should be 1.0 (65536 bits)")
+assert(last_sent_intent.action.target_direction.y_bits == 0, "normalized dy should be 0")
+
+-- 2. send_action with string coercion
+loci.send_action("2", "0", "-5")
+assert(last_sent_intent.action.ability_id == 2, "ability_id string must be accepted")
+assert(last_sent_intent.action.target_direction.x_bits == 0, "dx should be 0")
+assert(last_sent_intent.action.target_direction.y_bits == -65536, "dy should be -1.0 (-65536 bits)")
+
+-- 3. send_action_at_position (p10 is at x=5, y=10; target is at x=15, y=10 -> delta is (+10, 0))
+loci.send_action_at_position(3, 15, 10)
+assert(last_sent_intent.action.ability_id == 3, "ability_id must be 3")
+assert(last_sent_intent.action.target_direction.x_bits == 65536, "aiming (+10, 0) should normalize to (+1, 0)")
+assert(last_sent_intent.action.target_direction.y_bits == 0, "y_bits should be 0")
+
+-- 4. send_action_direction alias
+loci.send_action_direction(4, 0, 1)
+assert(last_sent_intent.action.ability_id == 4, "ability_id must be 4")
+assert(last_sent_intent.action.target_direction.y_bits == 65536, "dy should be 1.0 (65536 bits)")
 
 print("All loci_client.lua SDK unit tests passed successfully!")

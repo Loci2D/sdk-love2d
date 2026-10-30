@@ -1,0 +1,216 @@
+name: Release & Binary Distribution
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v0.6.1)'
+        required: false
+        type: string
+      force_release:
+        description: 'Force release even if tag already exists'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  check-version:
+    name: Check Version & Tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get_version.outputs.version }}
+      tag: ${{ steps.get_version.outputs.tag }}
+      should_release: ${{ steps.check_release.outputs.should_release }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Determine Version and Tag
+        id: get_version
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+            VERSION="${TAG#v}"
+          elif [[ -n "${{ github.event.inputs.tag }}" ]]; then
+            TAG="${{ github.event.inputs.tag }}"
+            VERSION="${TAG#v}"
+          else
+            # Extract from loci_client.lua VERSION = "..."
+            VERSION=$(grep -oE 'VERSION = "[^"]+"' loci_client.lua | cut -d'"' -f2)
+            TAG="v${VERSION}"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: ${VERSION} (tag: ${TAG})"
+
+      - name: Check Existing Release
+        id: check_release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.get_version.outputs.tag }}
+        run: |
+          if [[ "${{ github.event.inputs.force_release }}" == "true" ]]; then
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          elif gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release $TAG already exists on GitHub."
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Release $TAG does not exist yet. Proceeding with build."
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-linux:
+    name: Build Linux Binary (pb.so)
+    needs: check-version
+    if: needs.check-version.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Compile pb.so
+        run: |
+          mkdir -p build-out
+          gcc -O2 -shared -fPIC -Ilib/src/include lib/src/pb.c -o build-out/pb.so
+          ls -la build-out/pb.so
+
+      - name: Upload Linux Binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: pb-linux
+          path: build-out/pb.so
+          retention-days: 1
+
+  build-macos:
+    name: Build macOS Binary (pb.dylib)
+    needs: check-version
+    if: needs.check-version.outputs.should_release == 'true'
+    runs-on: macos-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Compile Universal pb.dylib (arm64 + x86_64)
+        run: |
+          mkdir -p build-out
+          clang -O2 -bundle -undefined dynamic_lookup \
+            -arch arm64 -arch x86_64 \
+            -Ilib/src/include lib/src/pb.c \
+            -o build-out/pb.dylib
+          ls -la build-out/pb.dylib
+
+      - name: Upload macOS Binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: pb-macos
+          path: build-out/pb.dylib
+          retention-days: 1
+
+  build-windows:
+    name: Build Windows Binary (pb.dll)
+    needs: check-version
+    if: needs.check-version.outputs.should_release == 'true'
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Fetch Love2D Windows Lua51 DLL and Compile
+        shell: bash
+        run: |
+          mkdir -p build-out love-win
+          # Download official Love2D 11.5 64-bit release to obtain lua51.dll
+          curl -fSL -o love-win.zip "https://github.com/love2d/love/releases/download/11.5/love-11.5-win64.zip"
+          unzip -q -o love-win.zip -d love-win/
+          cp love-win/love-11.5-win64/lua51.dll .
+          
+          # Compile pb.dll directly linking against lua51.dll using MinGW gcc
+          gcc -O2 -shared -s -Ilib/src/include lib/src/pb.c lua51.dll -o build-out/pb.dll
+          ls -la build-out/pb.dll
+
+      - name: Upload Windows Binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: pb-windows
+          path: build-out/pb.dll
+          retention-days: 1
+
+  publish-release:
+    name: Package & Publish GitHub Release
+    needs: [check-version, build-linux, build-macos, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Download Linux Binary
+        uses: actions/download-artifact@v4
+        with:
+          name: pb-linux
+          path: downloaded-binaries/linux
+
+      - name: Download macOS Binary
+        uses: actions/download-artifact@v4
+        with:
+          name: pb-macos
+          path: downloaded-binaries/macos
+
+      - name: Download Windows Binary
+        uses: actions/download-artifact@v4
+        with:
+          name: pb-windows
+          path: downloaded-binaries/windows
+
+      - name: Package Distribution Bundles
+        run: |
+          mkdir -p package-bundle/loci2d/lib
+          mkdir -p release-assets
+
+          # 1. Populate loci2d SDK drop-in folder
+          cp loci_client.lua package-bundle/loci2d/
+          cp README.md LICENSE AI_REFERENCE.md package-bundle/loci2d/
+          cp lib/game_packets.proto package-bundle/loci2d/lib/
+          cp lib/game_packets.pb package-bundle/loci2d/lib/
+          cp lib/protoc.lua package-bundle/loci2d/lib/
+
+          # 2. Add native pre-compiled binaries
+          cp downloaded-binaries/linux/pb.so package-bundle/loci2d/lib/
+          cp downloaded-binaries/macos/pb.dylib package-bundle/loci2d/lib/
+          cp downloaded-binaries/windows/pb.dll package-bundle/loci2d/lib/
+
+          # 3. Create zip and tar.gz release bundles
+          cd package-bundle
+          zip -r "../release-assets/loci2d-sdk-love2d.zip" loci2d
+          tar -czf "../release-assets/loci2d-sdk-love2d.tar.gz" loci2d
+          cd ..
+
+          # 4. Also attach standalone binaries directly to release for quick reference
+          cp downloaded-binaries/linux/pb.so release-assets/pb-linux-x86_64.so
+          cp downloaded-binaries/macos/pb.dylib release-assets/pb-macos-universal.dylib
+          cp downloaded-binaries/windows/pb.dll release-assets/pb-windows-x86_64.dll
+
+      - name: Generate Checksums
+        working-directory: release-assets
+        run: |
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create or Update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.check-version.outputs.tag }}
+        run: |
+          echo "Publishing release for tag: $TAG"
+          gh release create "$TAG" release-assets/* \
+            --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
+            --title "Loci2D Love2D SDK ${TAG}" \
+            --generate-notes || \
+          gh release upload "$TAG" release-assets/* \
+            --repo "${{ github.repository }}" \
+            --clobber

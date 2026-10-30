@@ -32,7 +32,9 @@ Entities are NOT simple tables. They have a metatable that automatically casts p
 
 ### 4. Sending Intents (Client -> Server)
 - `loci.send_move(dir_x, dir_y)`: Sends a movement intent. The vector does not need to be normalized.
-- `loci.send_action(ability_id, aim_world_x, aim_world_y)`: Casts an ability. The coordinates must be **World Space** coordinates, not screen space.
+- `loci.send_action(ability_id, dir_x, dir_y)`: Casts an ability aiming in a direction vector.
+- `loci.send_action_at_position(ability_id, target_world_x, target_world_y)`: Casts an ability towards a World Space coordinate (automatically calculates direction vector from local player entity).
+- `loci.send_action_direction(ability_id, dir_x, dir_y)`: Explicit directional cast alias for `send_action`.
 
 ### 5. Event Callbacks (Server -> Client)
 The developer must assign functions to these callbacks to react to server events:

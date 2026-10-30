@@ -9,7 +9,7 @@ The **Loci2D Love2D SDK** (`loci_client.lua`) is a high-level abstraction layer 
 ## SDK Directory Structure
 
 ```text
-sdks/love2d/
+sdk-love2d/
 ├── loci_client.lua        # Main client module (API Facade, State Manager, and Netcode)
 ├── test_sdk.lua           # Unit test suite to validate the SDK locally
 ├── AI_REFERENCE.md        # Compact API reference formatted for LLMs / AI Agents
@@ -49,7 +49,7 @@ If you have already verified your environment via the root script (`./tools/setu
 Before launching your game in Love2D, you can verify that all abstractions (such as `Entity` metatables, auto-typed property casting, spatial radius queries, and event dispatching) are functional on your system by running:
 
 ```bash
-lua sdks/love2d/test_sdk.lua
+lua test_sdk.lua
 ```
 
 If the environment is configured correctly, the test suite will output:
@@ -63,12 +63,12 @@ All loci_client.lua SDK unit tests passed successfully!
 
 ```lua
 -- main.lua
-package.path = package.path .. ";sdks/love2d/?.lua"
+package.path = package.path .. ";./loci2d/?.lua;./?.lua"
 local loci = require("loci_client")
 
 function love.load()
     -- Connect to the authoritative server
-    loci.connect("127.0.0.1", 8080, "Player1", "sdks/love2d/lib/")
+    loci.connect("127.0.0.1", 8080, "Player1")
 
     loci.on_action_cast = function(entity, ability_id, dir_x, dir_y)
         print("Ability cast by entity:", entity.id)
@@ -104,4 +104,4 @@ function love.quit()
 end
 ```
 
-For the complete interactive guide, open `sdks/love2d/docs/index.html` in your browser.
+For the complete interactive guide, open `docs/index.html` in your browser.
