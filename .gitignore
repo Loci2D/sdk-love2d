@@ -1,0 +1,15 @@
+# Compiled native libraries (generated or downloaded via setup / CI)
+*.so
+*.dll
+*.dylib
+*.o
+*.a
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Logs and runtime artifacts
+*.log
+/dist/
+/release-assets/
