@@ -270,8 +270,16 @@
                     <td>Envia intenção de movimento. <code>(1, 0)</code>, <code>(-1, -1)</code>, etc.</td>
                 </tr>
                 <tr>
-                    <td><code>loci.send_action(ability_id, x, y)</code></td>
-                    <td>Envia intenção de cast de magia ou ataque para o mundo (X, Y).</td>
+                    <td><code>loci.send_action(ability_id, dir_x, dir_y)</code></td>
+                    <td>Envia intenção de cast de habilidade ou ataque na direção do vetor (dir_x, dir_y).</td>
+                </tr>
+                <tr>
+                    <td><code>loci.send_action_at_position(ability_id, x, y)</code></td>
+                    <td>Calcula automaticamente a direção da mira a partir da posição do jogador e dispara a habilidade.</td>
+                </tr>
+                <tr>
+                    <td><code>loci.send_action_direction(ability_id, dir_x, dir_y)</code></td>
+                    <td>Alias explícito para disparo direcional de habilidade.</td>
                 </tr>
                 <tr>
                     <td><code>loci.get_entities()</code></td>

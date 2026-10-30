@@ -1,8 +1,8 @@
 -- Test suite for loci_client.lua (Love2D Client SDK)
 -- Validates Entity metatable, auto-casting, helpers, and packet handling.
 
-package.path = package.path .. ";./sdks/love2d/?.lua;./sdks/love2d/lib/?.lua;./?.lua;./lib/?.lua"
-package.cpath = package.cpath .. ";/usr/local/lib/lua/5.1/?.so;./sdks/love2d/lib/?.so;./lib/?.so"
+package.path = package.path .. ";./?.lua;./lib/?.lua"
+package.cpath = package.cpath .. ";./lib/?.so;./lib/?.dylib;./lib/?.dll;./?.so;./?.dylib;./?.dll;/usr/local/lib/lua/5.1/?.so"
 
 local loci = require("loci_client")
 
