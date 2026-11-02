@@ -164,3 +164,20 @@ end)
 
 ### **Phase 3: Smooth Error Reconciliation**
 - Implement exponential error decay buffer to blend positional corrections seamlessly on obstacle collisions.
+
+---
+
+## 7. Documentation & Developer Guides Update (`docs/`)
+
+Once the netcode implementation phases are completed and validated, the usage documentation in `docs/` and the project guides must be updated to reflect the new capabilities:
+
+1. **Interactive Visual Guide (`docs/index.html`):**
+   - Add a dedicated subsection on **Network Smoothing & Latency Compensation**.
+   - Document all `loci.netcode` configuration parameters (`prediction_enabled`, `interpolation_delay`, `reconciliation_threshold`, `snap_threshold`, `error_decay_rate`, `default_move_speed`).
+   - Provide visual/interactive explanations for tuning `interpolation_delay` (LAN Wi-Fi vs. Online WAN).
+   - Document the extensibility hook `loci.set_prediction_handler(fn)` with an example of custom physics/acceleration.
+2. **AI & LLM Reference (`AI_REFERENCE.md`):**
+   - Update API surface and type signatures for `loci.netcode` and prediction handlers.
+3. **Project Readmes (`README.md` & `README.pt-BR.md`):**
+   - Add a brief snippet in the Quickstart showing how developers can fine-tune netcode in `love.load()`.
+
