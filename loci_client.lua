@@ -118,6 +118,12 @@ local function new_entity(id, blueprint)
         y = 0,
         vx = 0,
         vy = 0,
+        server_x = nil,
+        server_y = nil,
+        server_vx = 0,
+        server_vy = 0,
+        _error_x = 0,
+        _error_y = 0,
         properties = {}
     }
     setmetatable(ent, Entity)
@@ -171,6 +177,8 @@ loci = {
     _snapshot_buffer = {},
     _max_snapshot_history = 20,
     _prediction_handler = nil,
+    _active_move_dx = 0,
+    _active_move_dy = 0,
 }
 
 function loci.get_server_tick_rate()
@@ -194,6 +202,8 @@ end
 
 function loci.connect(host, port, player_name, base_path, tick_rate)
     loci._snapshot_buffer = {}
+    loci._active_move_dx = 0
+    loci._active_move_dy = 0
     if base_path then
         loci._base_path = base_path
     end
@@ -296,6 +306,8 @@ end
 
 function loci.disconnect(reason)
     loci._snapshot_buffer = {}
+    loci._active_move_dx = 0
+    loci._active_move_dy = 0
     if loci._udp then
         loci._send_intent({ disconnect = { reason = reason or "client closing" } })
         loci._udp:close()
@@ -320,7 +332,28 @@ function loci._send_intent(intent_table)
 end
 
 function loci.send_move(dir_x, dir_y)
-    loci._send_intent({ move = { direction = { x_bits = float_to_bits(dir_x), y_bits = float_to_bits(dir_y) } } })
+    local dx = tonumber(dir_x) or 0
+    local dy = tonumber(dir_y) or 0
+    loci._active_move_dx = dx
+    loci._active_move_dy = dy
+
+    -- Immediate local velocity update for client prediction (Phase 2 - ADR 0001)
+    if loci.netcode and loci.netcode.prediction_enabled and loci.my_entity_id then
+        local my_ent = loci.entities[loci.my_entity_id]
+        if my_ent then
+            local len = math.sqrt(dx * dx + dy * dy)
+            if len > 0 then
+                local move_speed = tonumber(my_ent:get("move_speed") or my_ent:get("speed") or loci.netcode.default_move_speed) or 3.0
+                my_ent.vx = (dx / len) * move_speed
+                my_ent.vy = (dy / len) * move_speed
+            else
+                my_ent.vx = 0
+                my_ent.vy = 0
+            end
+        end
+    end
+
+    loci._send_intent({ move = { direction = { x_bits = float_to_bits(dx), y_bits = float_to_bits(dy) } } })
 end
 
 function loci.send_action(ability_id, dir_x, dir_y)
@@ -520,32 +553,93 @@ function loci.update(dt)
 
     for _, entity in pairs(loci.entities) do
         if loci.my_entity_id and entity.id == loci.my_entity_id then
-            -- Local player: (Phase 2 will implement Client-Side Prediction here)
-            local vx_sec = (entity.vx or 0) * tick_rate
-            local vy_sec = (entity.vy or 0) * tick_rate
+            if loci.netcode and loci.netcode.prediction_enabled then
+                -- Client-Side Prediction (Phase 2 - ADR 0001)
+                local is_dead_prop = entity:get("is_dead")
+                local is_dead = (is_dead_prop == "true" or is_dead_prop == true or is_dead_prop == 1 or is_dead_prop == "1")
+                local cur_tick = loci._last_state_tick or 0
+                local stunned_until = tonumber(entity:get("stunned_until")) or 0
+                local paralyzed_until = tonumber(entity:get("paralyzed_until")) or 0
+                local dashing_until = tonumber(entity:get("dashing_until")) or 0
+                local incapacitated = is_dead or (cur_tick < stunned_until) or (cur_tick < paralyzed_until)
 
-            if entity.server_x and entity.server_y then
-                entity.server_x = entity.server_x + vx_sec * dt
-                entity.server_y = entity.server_y + vy_sec * dt
-                
-                local dx = entity.server_x - entity.x
-                local dy = entity.server_y - entity.y
-                local dist2 = dx * dx + dy * dy
-                local snap_thresh = loci.netcode.snap_threshold or 50.0
+                if incapacitated then
+                    entity.vx = 0
+                    entity.vy = 0
+                elseif cur_tick < dashing_until then
+                    -- Dash active: let server physical velocity guide displacement
+                    local vx_sec = (entity.vx or 0) * tick_rate
+                    local vy_sec = (entity.vy or 0) * tick_rate
+                    entity.x = entity.x + vx_sec * dt
+                    entity.y = entity.y + vy_sec * dt
+                elseif loci._prediction_handler then
+                    -- Pluggable prediction hook for custom physics
+                    loci._prediction_handler(entity, loci._active_move_dx or 0, loci._active_move_dy or 0, dt)
+                else
+                    -- Default Kinematic Prediction
+                    local in_dx = loci._active_move_dx or 0
+                    local in_dy = loci._active_move_dy or 0
+                    local len = math.sqrt(in_dx * in_dx + in_dy * in_dy)
 
-                if dist2 > (snap_thresh * snap_thresh) then
-                    entity.x = entity.server_x
-                    entity.y = entity.server_y
-                elseif dist2 > 0.01 then
-                    entity.x = entity.x + dx * math.min(1.0, 15.0 * dt)
-                    entity.y = entity.y + dy * math.min(1.0, 15.0 * dt)
+                    if len > 0 then
+                        local ndx = in_dx / len
+                        local ndy = in_dy / len
+                        local move_speed = tonumber(entity:get("move_speed") or entity:get("speed") or loci.netcode.default_move_speed) or 3.0
+                        local speed_sec = move_speed * tick_rate
+
+                        entity.x = entity.x + ndx * speed_sec * dt
+                        entity.y = entity.y + ndy * speed_sec * dt
+                        entity.vx = ndx * move_speed
+                        entity.vy = ndy * move_speed
+                    else
+                        entity.vx = 0
+                        entity.vy = 0
+                    end
+                end
+
+                -- Smooth exponential error decay (Phase 3 reconciliation)
+                if (entity._error_x and entity._error_x ~= 0) or (entity._error_y and entity._error_y ~= 0) then
+                    local decay_rate = loci.netcode.error_decay_rate or 15.0
+                    local decay = math.exp(-decay_rate * dt)
+                    local step_x = entity._error_x * (1.0 - decay)
+                    local step_y = entity._error_y * (1.0 - decay)
+                    entity.x = entity.x + step_x
+                    entity.y = entity.y + step_y
+                    entity._error_x = entity._error_x * decay
+                    entity._error_y = entity._error_y * decay
+                    if math.abs(entity._error_x) < 0.01 and math.abs(entity._error_y) < 0.01 then
+                        entity._error_x = 0
+                        entity._error_y = 0
+                    end
+                end
+            else
+                -- Fallback when prediction is disabled: Lerp towards theoretical server position
+                local vx_sec = (entity.vx or 0) * tick_rate
+                local vy_sec = (entity.vy or 0) * tick_rate
+
+                if entity.server_x and entity.server_y then
+                    entity.server_x = entity.server_x + vx_sec * dt
+                    entity.server_y = entity.server_y + vy_sec * dt
+                    
+                    local dx = entity.server_x - entity.x
+                    local dy = entity.server_y - entity.y
+                    local dist2 = dx * dx + dy * dy
+                    local snap_thresh = loci.netcode.snap_threshold or 50.0
+
+                    if dist2 > (snap_thresh * snap_thresh) then
+                        entity.x = entity.server_x
+                        entity.y = entity.server_y
+                    elseif dist2 > 0.01 then
+                        entity.x = entity.x + dx * math.min(1.0, 15.0 * dt)
+                        entity.y = entity.y + dy * math.min(1.0, 15.0 * dt)
+                    else
+                        entity.x = entity.x + vx_sec * dt
+                        entity.y = entity.y + vy_sec * dt
+                    end
                 else
                     entity.x = entity.x + vx_sec * dt
                     entity.y = entity.y + vy_sec * dt
                 end
-            else
-                entity.x = entity.x + vx_sec * dt
-                entity.y = entity.y + vy_sec * dt
             end
         else
             -- Remote entities: Snapshot Interpolation (Phase 1 - ADR 0001)
@@ -662,6 +756,29 @@ function loci._handle_world_state(state)
                 if is_new then
                     ent.x = nx
                     ent.y = ny
+                elseif loci.my_entity_id and entity_id == loci.my_entity_id and loci.netcode and loci.netcode.prediction_enabled then
+                    -- Reconcile predicted position with authoritative server position
+                    local err_x = nx - ent.x
+                    local err_y = ny - ent.y
+                    local dist2 = err_x * err_x + err_y * err_y
+                    local snap_thresh = loci.netcode.snap_threshold or 50.0
+                    local rec_thresh = loci.netcode.reconciliation_threshold or 2.0
+
+                    if dist2 > (snap_thresh * snap_thresh) then
+                        -- Critical error: hard snap (teleport, respawn, hard knockback)
+                        ent.x = nx
+                        ent.y = ny
+                        ent._error_x = 0
+                        ent._error_y = 0
+                    elseif dist2 > (rec_thresh * rec_thresh) then
+                        -- Moderate error: store error offset for exponential decay smoothing
+                        ent._error_x = err_x
+                        ent._error_y = err_y
+                    else
+                        -- Negligible error (< 2px): ignore micro-discrepancy
+                        ent._error_x = 0
+                        ent._error_y = 0
+                    end
                 end
             else
                 ent.x = ent.x or 0
@@ -670,11 +787,21 @@ function loci._handle_world_state(state)
             
             -- Update Velocity (for interpolation)
             if raw_ent.velocity then
-                ent.vx = bits_to_float(raw_ent.velocity.x_bits)
-                ent.vy = bits_to_float(raw_ent.velocity.y_bits)
+                local svx = bits_to_float(raw_ent.velocity.x_bits)
+                local svy = bits_to_float(raw_ent.velocity.y_bits)
+                ent.server_vx = svx
+                ent.server_vy = svy
+                if not (loci.my_entity_id and entity_id == loci.my_entity_id and loci.netcode and loci.netcode.prediction_enabled) then
+                    ent.vx = svx
+                    ent.vy = svy
+                end
             else
-                ent.vx = 0
-                ent.vy = 0
+                ent.server_vx = 0
+                ent.server_vy = 0
+                if not (loci.my_entity_id and entity_id == loci.my_entity_id and loci.netcode and loci.netcode.prediction_enabled) then
+                    ent.vx = 0
+                    ent.vy = 0
+                end
             end
             
             -- Diff properties with auto-casting

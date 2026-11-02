@@ -164,6 +164,13 @@ local state_snap1 = {
     _receive_time = 1.000,
     entities = {
         {
+            id = 10,
+            name = "Player_Hero",
+            position = { x_bits = 65536 * 5, y_bits = 65536 * 10 },
+            velocity = { x_bits = 0, y_bits = 0 },
+            properties = {}
+        },
+        {
             id = 11,
             name = "Enemy_Minion",
             position = { x_bits = 65536 * 10, y_bits = 65536 * 20 },
@@ -179,6 +186,13 @@ local state_snap2 = {
     tick = 13,
     _receive_time = 1.100,
     entities = {
+        {
+            id = 10,
+            name = "Player_Hero",
+            position = { x_bits = 65536 * 5, y_bits = 65536 * 10 },
+            velocity = { x_bits = 0, y_bits = 0 },
+            properties = {}
+        },
         {
             id = 11,
             name = "Enemy_Minion",
@@ -217,6 +231,13 @@ local state_snap3_teleport = {
     _receive_time = 1.200,
     entities = {
         {
+            id = 10,
+            name = "Player_Hero",
+            position = { x_bits = 65536 * 5, y_bits = 65536 * 10 },
+            velocity = { x_bits = 0, y_bits = 0 },
+            properties = {}
+        },
+        {
             id = 11,
             name = "Enemy_Minion",
             position = { x_bits = 65536 * 200, y_bits = 65536 * 200 }, -- Teleported 170+ units away
@@ -236,5 +257,145 @@ assert(minion.y == 200, "teleported entity should snap to 200 on alpha >= 0.5 wi
 
 -- Reset mock time
 loci._mock_time = nil
+
+-- ============================================================================
+-- Phase 2 Unit Tests: Client-Side Prediction for Local Player Avatar
+-- ============================================================================
+
+local hero = loci.entities[10]
+assert(hero ~= nil, "local player entity (10) must exist")
+assert(hero:is_local_player() == true, "hero must be identified as local player")
+
+-- Reset hero position to (100, 100)
+hero.x = 100.0
+hero.y = 100.0
+hero.server_x = 100.0
+hero.server_y = 100.0
+hero._error_x = 0
+hero._error_y = 0
+loci.server_tick_rate = 30.0
+
+-- 1. Test immediate velocity update on send_move
+loci.send_move(1, 0)
+assert(loci._active_move_dx == 1, "active_move_dx must be 1")
+assert(loci._active_move_dy == 0, "active_move_dy must be 0")
+assert(hero.vx == 3.0, "hero.vx should immediately update to default_move_speed 3.0, got " .. tostring(hero.vx))
+assert(hero.vy == 0, "hero.vy should be 0")
+
+-- 2. Test continuous prediction displacement in update(dt)
+-- Speed: move_speed (3.0) * tick_rate (30) = 90 pixels/sec
+-- For dt = 0.100s, displacement should be 9.0 pixels: x = 100 + 9 = 109.0
+loci.update(0.100)
+assert(math.abs(hero.x - 109.0) < 0.001, "hero.x should advance to 109.0, got " .. tostring(hero.x))
+assert(hero.y == 100.0, "hero.y should remain at 100.0")
+
+-- Advance again for another 0.100s: x = 109 + 9 = 118.0
+loci.update(0.100)
+assert(math.abs(hero.x - 118.0) < 0.001, "hero.x should advance to 118.0, got " .. tostring(hero.x))
+
+-- 3. Test stop movement on send_move(0, 0)
+loci.send_move(0, 0)
+assert(hero.vx == 0, "hero.vx should be 0 on stop")
+assert(hero.vy == 0, "hero.vy should be 0 on stop")
+loci.update(0.100)
+assert(math.abs(hero.x - 118.0) < 0.001, "hero.x should remain unchanged after stopping")
+
+-- 4. Test dynamic move_speed adaptation
+hero.properties["move_speed"] = 5.0
+loci.send_move(0, 1) -- moving down
+assert(hero.vy == 5.0, "hero.vy should adapt to move_speed 5.0, got " .. tostring(hero.vy))
+-- Speed: 5.0 * 30 = 150 px/s -> for dt = 0.1s: dy = 15.0 px -> y = 100 + 15 = 115.0
+loci.update(0.100)
+assert(math.abs(hero.y - 115.0) < 0.001, "hero.y should advance to 115.0 with speed 5.0, got " .. tostring(hero.y))
+loci.send_move(0, 0)
+
+-- 5. Test status effect crowd control gate (paralyzed / stunned / dead)
+hero.properties["is_dead"] = "true"
+loci.send_move(1, 0)
+loci.update(0.100)
+assert(math.abs(hero.x - 118.0) < 0.001, "dead hero must not advance via prediction")
+hero.properties["is_dead"] = "false"
+
+loci._last_state_tick = 50
+hero.properties["stunned_until"] = "100"
+loci.send_move(1, 0)
+loci.update(0.100)
+assert(math.abs(hero.x - 118.0) < 0.001, "stunned hero must not advance via prediction")
+hero.properties["stunned_until"] = "0"
+loci.send_move(0, 0)
+
+-- 6. Test Authoritative Reconciliation:
+-- Hero is at x = 118.0, y = 115.0
+-- Server sends snapshot where hero is at (118.5, 115.0) -> delta = 0.5px (< reconciliation_threshold 2.0px)
+local state_reconcile_small = {
+    tick = 55,
+    entities = {
+        {
+            id = 10,
+            name = "Player_Hero",
+            position = { x_bits = math.floor(118.5 * 65536), y_bits = math.floor(115.0 * 65536) },
+            velocity = { x_bits = 0, y_bits = 0 },
+            properties = {}
+        }
+    }
+}
+loci._handle_world_state(state_reconcile_small)
+assert(math.abs(hero.x - 118.0) < 0.001, "small error (<2px) should not jitter local position")
+assert(hero._error_x == 0, "_error_x should be 0 on negligible error")
+
+-- Server sends snapshot with moderate divergence: server says (125.0, 115.0) -> delta = 7.0px (>2px, <50px)
+local state_reconcile_moderate = {
+    tick = 56,
+    entities = {
+        {
+            id = 10,
+            name = "Player_Hero",
+            position = { x_bits = math.floor(125.0 * 65536), y_bits = math.floor(115.0 * 65536) },
+            velocity = { x_bits = 0, y_bits = 0 },
+            properties = {}
+        }
+    }
+}
+loci._handle_world_state(state_reconcile_moderate)
+assert(math.abs(hero._error_x - 7.0) < 0.01, "_error_x should record moderate delta for smoothing, got " .. tostring(hero._error_x))
+
+-- Advance update(dt) to let error decay exponentially towards 125.0
+loci.update(0.100)
+assert(hero.x > 118.0 and hero.x < 125.0, "hero.x should smoothly decay towards server position, current: " .. tostring(hero.x))
+-- After several frames, error decay converges completely
+for _ = 1, 30 do
+    loci.update(0.016)
+end
+assert(math.abs(hero.x - 125.0) < 0.05, "hero.x should converge to 125.0 after decay, got " .. tostring(hero.x))
+assert(hero._error_x == 0, "_error_x should clear once decayed")
+
+-- Server sends critical rubberband/teleport (>50px, e.g. x = 300.0)
+local state_reconcile_snap = {
+    tick = 57,
+    entities = {
+        {
+            id = 10,
+            name = "Player_Hero",
+            position = { x_bits = math.floor(300.0 * 65536), y_bits = math.floor(115.0 * 65536) },
+            velocity = { x_bits = 0, y_bits = 0 },
+            properties = {}
+        }
+    }
+}
+loci._handle_world_state(state_reconcile_snap)
+assert(math.abs(hero.x - 300.0) < 0.001, "hero.x should hard snap to 300.0 on discrepancy > 50px")
+
+-- 7. Test custom prediction handler hook
+local custom_handler_called = false
+loci.set_prediction_handler(function(ent, dx, dy, dt)
+    custom_handler_called = true
+    ent.x = ent.x + 99.0 * dt
+end)
+loci.send_move(1, 0)
+loci.update(0.100)
+assert(custom_handler_called == true, "custom prediction handler must be called when set")
+assert(math.abs(hero.x - 309.9) < 0.001, "custom handler displacement should be applied")
+loci.set_prediction_handler(nil) -- reset hook
+loci.send_move(0, 0)
 
 print("All loci_client.lua SDK unit tests passed successfully!")
