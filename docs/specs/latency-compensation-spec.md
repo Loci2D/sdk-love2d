@@ -1,18 +1,20 @@
 # Technical Specification: Latency & Jitter Compensation in LÖVE2D SDK
 **Module:** `loci_client.lua` (`sdk-love2d`)  
 **Author:** Antigravity / Loci2D Team  
-**Status:** Proposed / In Review  
+**Status:** Accepted  
 **Compatibility:** `loci2d` v0.6.x+  
+**Architecture Record:** [ADR 0001](../adr/en/0001-client-side-prediction-and-snapshot-interpolation.md)
 
 ---
 
 ## 1. Context & Motivation
 
-During tests on a local wireless network (Wi-Fi), even when disconnected from the external internet, significant **jitter (stuttering and visual hitches)** was observed in character movement and animations.
+During tests on a local wireless network (Wi-Fi), even when disconnected from the external internet, significant **jitter (stuttering and visual hitches)** was observed in character movement and camera tracking.
 
 ### Root Cause Analysis:
 1. **Lack of Client-Side Prediction (CSP):** The client sends `send_move(dx, dy)` and passively waits for the server to reply with the updated `WorldState` before moving the local player avatar. Consequently, the player feels the cumulative delay of: `Time to next server tick (~33.3ms at 30Hz)` + `Wi-Fi RTT (5–20ms)` + `Wireless radio jitter`.
-2. **Unstable Extrapolation for Remote Entities:** The current SDK attempts to extrapolate future positions using `server_x + vx * dt`. Under Wi-Fi packet timing variance or whenever another player stops or suddenly changes direction, this dead reckoning overshoots and triggers harsh visual snapping/rubberbanding.
+2. **Camera-Player Coupling:** In game clients (e.g. `loci-arena`), the camera is directly anchored to `my_entity.x` and `my_entity.y`. Any packet delay instantly freezes not just the character, but the entire rendered scene.
+3. **Unstable Extrapolation for Remote Entities:** The current SDK attempts to extrapolate future positions using `server_x + vx * dt`. Under Wi-Fi packet timing variance or whenever another player stops or suddenly changes direction, this dead reckoning overshoots and triggers harsh visual snapping/rubberbanding.
 
 ---
 
@@ -24,19 +26,20 @@ During tests on a local wireless network (Wi-Fi), even when disconnected from th
 | Component | Reusability Level | Ensuring 100% Game Agnosticism |
 | :--- | :--- | :--- |
 | **Snapshot Interpolation Buffer (Remote Entities)** | **100% Generic** | Any 2D game built on `loci2d` receives `(x, y)` and `(vx, vy)`. Interpolating remote entities in the past with a fixed delay does not depend on any gameplay logic. |
-| **Input Reconciliation Pipeline** | **100% Generic** | Tracking pending inputs, matching them with server confirmations, and smoothing positional errors is standard netcode mathematics. |
-| **Avatar Physics/Movement Prediction** | **Extensible (Default + Hook)** | The SDK provides a default kinematic model (`x = x + dir_x * speed * dt`) suitable for most 2D top-down games, while reading dynamic speed properties (`entity:get("speed")`). For games requiring custom physics (e.g., inertia, custom acceleration, or client-side wall collision anticipation), the SDK exposes a pluggable callback `loci.set_prediction_handler(fn)`. |
+| **Input Reconciliation Pipeline** | **100% Generic** | Tracking persistent input direction, comparing predicted coordinates against server snapshots, and smoothing positional errors via exponential decay is standard netcode mathematics. |
+| **Avatar Physics/Movement Prediction** | **Extensible (Default + Hook)** | The SDK provides a default kinematic model (`x = x + dir_x * speed_sec * dt`) that queries dynamic entity speed properties (`"move_speed"` or `"speed"`). For games requiring custom physics (e.g., inertia, custom acceleration, or client-side wall collision anticipation), the SDK exposes a pluggable callback `loci.set_prediction_handler(fn)`. |
 
 ---
 
 ## 3. System Architecture
 
 ```
-[ Keyboard / Gamepad Input ]
+[ Keyboard / Virtual Joystick Input ]
              │
-             ├──> [ loci.send_move ] ──> Sends packet with sequence_id over the network
+             ├──> [ loci.send_move ] ──> Sends packet to server (on direction change)
+             │                           Caches _active_move_dx, _active_move_dy internally
              │
-             └──> [ Client Prediction ]
+             └──> [ Client Prediction in update(dt) ]
                         │
                         ▼ (Applies IMMEDIATE displacement in local frame)
                  my_entity.x, my_entity.y
@@ -44,7 +47,7 @@ During tests on a local wireless network (Wi-Fi), even when disconnected from th
 [ Network: Received WorldState ]
              │
              ├──> If Local Avatar  ──> [ Reconciler with Error Smoothing ]
-             │                         (Smoothly absorbs discrepancies)
+             │                         (Smoothly absorbs discrepancies via exponential decay)
              │
              └──> If Remote Entity ──> [ Snapshot Ring Buffer ]
                                               │
@@ -74,25 +77,33 @@ For entities other than the local player, rendering should always look slightly 
 
 ### 4.2. Client-Side Prediction (For Local Player)
 
-* **Input Sequencing:**
-  * Each call to `loci.send_move(dir_x, dir_y)` tracks a local input sequence and timestamp.
-  * The SDK applies movement immediately in the current frame:
-    $$\text{my\_entity.x} = \text{my\_entity.x} + \text{dx} \times \text{speed} \times dt$$
-  * Dynamic speed is automatically fetched via `my_entity:get("speed", default_speed)` or velocity magnitude, accounting for server-applied buffs/debuffs (e.g., slows, haste).
-  * The player feels zero input delay ($0\text{ms}$ perceived latency).
+* **Persistent Active Input Tracking:**
+  * Games typically invoke `send_move(dx, dy)` only when the directional vector changes (e.g., pressing or releasing keys).
+  * The SDK internally stores `_active_move_dx` and `_active_move_dy` whenever `send_move` is called.
+  * In `loci.update(dt)`, displacement is applied continuously every frame as long as an active input vector is held.
+* **Speed Unit Scaling & Property Resolution:**
+  * In `loci2d`, speed properties (e.g. `"move_speed" = 3.0`) represent **units per tick**.
+  * To calculate displacement per second in Love2D's `dt` (seconds):
+    $$\text{speed\_units\_per\_tick} = \text{entity:get("move\_speed")} \lor \text{entity:get("speed")} \lor \text{loci.netcode.default\_move\_speed}$$
+    $$\text{speed\_sec} = \text{speed\_units\_per\_tick} \times \text{loci.server\_tick\_rate}$$
+    $$\Delta x = \text{dir\_x} \times \text{speed\_sec} \times dt$$
+* **Status Effect & Death Gates:**
+  * The SDK checks status properties on `my_entity`:
+    * If `entity:get("is_dead") == "true"` or `entity:get("is_dead") == true`: prediction is suspended.
+    * If `current_tick < entity:get("stunned_until", 0)` or `current_tick < entity:get("paralyzed_until", 0)`: prediction is suspended.
+  * Ensures zero divergence when the player is incapacitated or under crowd control.
 
 ---
 
 ### 4.3. Smooth Error Reconciliation
 
 When the server responds with an authoritative snapshot:
-1. Discard unacknowledged inputs older than the server's processed state.
-2. Compare the authoritative server position against the client's predicted position at that timestamp.
-3. If a discrepancy exists (e.g., colliding with a server-side obstacle, or float delta):
-   * **Negligible Error ($< 2$ pixels):** Ignore correction to avoid micro-jitter.
+1. Compare the authoritative server position against the client's predicted position.
+2. If a discrepancy exists (e.g., colliding with a server-side obstacle, or float delta):
+   * **Negligible Error ($< 2$ pixels):** Ignored to avoid micro-tremors from floating-point roundoff.
    * **Moderate Error ($2$ to $50$ pixels):** Do not snap/teleport. Compute an error offset vector:
      $$\vec{E} = \text{pos}_{\text{authoritative}} - \text{pos}_{\text{predicted}}$$
-     Apply an exponential decay to the visual offset during rendering:
+     Apply exponential decay to the visual offset during rendering:
      $$\vec{E}(t + dt) = \vec{E}(t) \times e^{-\lambda \cdot dt}$$
      The player continues moving uninterrupted while the correction smoothly blends in.
    * **Critical Error ($> 50$ pixels / Hard Rubberband):** Immediate snap to server position (e.g., hard knockback, stun, or teleport).
@@ -122,15 +133,15 @@ loci.netcode = {
     -- Exponential decay rate for smoothing errors (higher = faster convergence)
     error_decay_rate = 15.0,
     
-    -- Fallback movement speed if entity property 'speed' is not present
-    default_move_speed = 150.0,
+    -- Fallback movement speed (units per tick) if property missing
+    default_move_speed = 3.0,
 }
 
 -- Pluggable prediction handler for projects requiring custom physics
--- If nil, the SDK uses the default kinematic model: dx * speed * dt
+-- If nil, the SDK uses the default kinematic model: dir * speed_sec * dt
 loci.set_prediction_handler(function(entity, dx, dy, dt)
     -- Example for games with acceleration or friction:
-    -- local speed = entity:get("speed", loci.netcode.default_move_speed)
+    -- local speed = (entity:get("move_speed") or loci.netcode.default_move_speed) * loci.server_tick_rate
     -- entity.vx = entity.vx + dx * accel * dt
     -- entity.x = entity.x + entity.vx * dt
 end)
@@ -146,10 +157,10 @@ end)
 - **Expected Outcome:** Remote player stuttering disappears completely on Wi-Fi.
 
 ### **Phase 2: Client-Side Prediction for Local Player**
-- Track input direction and query entity speed dynamically.
-- Apply immediate frame-accurate displacement in `send_move` and `update`.
-- Support dynamic server-side speed modifiers via entity properties.
-- **Expected Outcome:** Immediate, crisp input response for the local avatar.
+- Track persistent input direction (`_active_move_dx`, `_active_move_dy`).
+- Calculate dynamic speed (`move_speed * server_tick_rate`) and apply frame-accurate displacement.
+- Gate prediction by status effect properties (`stunned_until`, `paralyzed_until`, `is_dead`).
+- **Expected Outcome:** Immediate, crisp input response for the local avatar and camera.
 
 ### **Phase 3: Smooth Error Reconciliation**
-- Implement exponential error decay buffer to blend positional corrections seamlessly.
+- Implement exponential error decay buffer to blend positional corrections seamlessly on obstacle collisions.
