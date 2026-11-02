@@ -129,7 +129,7 @@ end
 -- ============================================================================
 loci = {
     -- Metadata
-    VERSION = "0.6.1",
+    VERSION = "0.6.2",
     COMPATIBLE_ENGINE_VERSION = "0.6.x",
     SCHEMA_VERSION = 1,
     entities = {},
@@ -138,6 +138,16 @@ loci = {
     match_state = "running",
     match_winner = "",
     server_tick_rate = tonumber(os.getenv and (os.getenv("LOCI_TICK_RATE") or os.getenv("TICK_RATE"))) or 30.0,
+
+    -- Netcode & Latency Compensation Configuration (ADR 0001)
+    netcode = {
+        prediction_enabled = true,
+        interpolation_delay = 0.050,      -- 50ms buffer (safe for 30Hz LAN Wi-Fi)
+        reconciliation_threshold = 2.0,    -- 2px tolerance
+        snap_threshold = 50.0,             -- 50px max error before hard snap
+        error_decay_rate = 15.0,           -- Exponential error smoothing
+        default_move_speed = 3.0,          -- Default units/tick
+    },
 
     -- Callbacks
     on_entity_spawned = function(entity) end,
@@ -158,6 +168,9 @@ loci = {
     _player_name = nil,
     _base_path = "lib/",
     _entities_list_cache = nil,
+    _snapshot_buffer = {},
+    _max_snapshot_history = 20,
+    _prediction_handler = nil,
 }
 
 function loci.get_server_tick_rate()
@@ -171,7 +184,16 @@ function loci.set_server_tick_rate(rate)
     end
 end
 
+function loci.set_prediction_handler(fn)
+    loci._prediction_handler = fn
+end
+
+function loci.get_snapshot_buffer()
+    return loci._snapshot_buffer
+end
+
 function loci.connect(host, port, player_name, base_path, tick_rate)
+    loci._snapshot_buffer = {}
     if base_path then
         loci._base_path = base_path
     end
@@ -273,6 +295,7 @@ function loci.connect(host, port, player_name, base_path, tick_rate)
 end
 
 function loci.disconnect(reason)
+    loci._snapshot_buffer = {}
     if loci._udp then
         loci._send_intent({ disconnect = { reason = reason or "client closing" } })
         loci._udp:close()
@@ -390,43 +413,147 @@ function loci.get_globals()
     return loci.globals
 end
 
-function loci.update(dt)
-    if not loci._udp then return end
+function loci._interpolate_remote_entity(entity, render_time, tick_rate)
+    local buffer = loci._snapshot_buffer
+    local buf_len = #buffer
 
-    -- Interpolation
-    local tick_rate = loci.server_tick_rate or 30.0
-    for _, entity in pairs(loci.entities) do
-        local vx_sec = (entity.vx or 0) * tick_rate
-        local vy_sec = (entity.vy or 0) * tick_rate
+    if buf_len >= 2 then
+        local s1, s2 = nil, nil
+        for i = buf_len, 2, -1 do
+            if buffer[i - 1].receive_time <= render_time then
+                s1 = buffer[i - 1]
+                s2 = buffer[i]
+                break
+            end
+        end
 
+        if s1 and s2 then
+            local p1 = s1.entities[entity.id]
+            local p2 = s2.entities[entity.id]
+            if p1 and p2 then
+                local span = s2.receive_time - s1.receive_time
+                local alpha = (span > 0) and math.min(1.0, math.max(0.0, (render_time - s1.receive_time) / span)) or 1.0
+                local dx = p2.x - p1.x
+                local dy = p2.y - p1.y
+                local snap_thresh = loci.netcode.snap_threshold or 50.0
+
+                if (dx * dx + dy * dy) > (snap_thresh * snap_thresh) then
+                    -- Hard teleport / rubberband: do not interpolate across map
+                    if alpha >= 0.5 then
+                        entity.x = p2.x
+                        entity.y = p2.y
+                        entity.vx = p2.vx or 0
+                        entity.vy = p2.vy or 0
+                    else
+                        entity.x = p1.x
+                        entity.y = p1.y
+                        entity.vx = p1.vx or 0
+                        entity.vy = p1.vy or 0
+                    end
+                else
+                    entity.x = p1.x + dx * alpha
+                    entity.y = p1.y + dy * alpha
+                    entity.vx = (p1.vx or 0) + ((p2.vx or 0) - (p1.vx or 0)) * alpha
+                    entity.vy = (p1.vy or 0) + ((p2.vy or 0) - (p1.vy or 0)) * alpha
+                end
+            elseif p2 then
+                entity.x = p2.x
+                entity.y = p2.y
+                entity.vx = p2.vx or 0
+                entity.vy = p2.vy or 0
+            elseif p1 then
+                entity.x = p1.x
+                entity.y = p1.y
+                entity.vx = p1.vx or 0
+                entity.vy = p1.vy or 0
+            end
+        elseif render_time > buffer[buf_len].receive_time then
+            -- Packet starvation / jitter: extrapolate slightly (up to 100ms) from newest snapshot
+            local newest = buffer[buf_len]
+            local p_new = newest.entities[entity.id]
+            if p_new then
+                local overdue = render_time - newest.receive_time
+                if overdue <= 0.100 then
+                    local vx_sec = (p_new.vx or 0) * tick_rate
+                    local vy_sec = (p_new.vy or 0) * tick_rate
+                    entity.x = p_new.x + vx_sec * overdue
+                    entity.y = p_new.y + vy_sec * overdue
+                else
+                    entity.x = p_new.x
+                    entity.y = p_new.y
+                end
+                entity.vx = p_new.vx or 0
+                entity.vy = p_new.vy or 0
+            end
+        elseif render_time < buffer[1].receive_time then
+            -- Render time is before oldest buffered state
+            local oldest = buffer[1]
+            local p_old = oldest.entities[entity.id]
+            if p_old then
+                entity.x = p_old.x
+                entity.y = p_old.y
+                entity.vx = p_old.vx or 0
+                entity.vy = p_old.vy or 0
+            end
+        end
+    elseif buf_len == 1 then
+        local p = buffer[1].entities[entity.id]
+        if p then
+            entity.x = p.x
+            entity.y = p.y
+            entity.vx = p.vx or 0
+            entity.vy = p.vy or 0
+        end
+    else
+        -- Fallback if no snapshots yet
         if entity.server_x and entity.server_y then
-            -- Predict theoretical server position using server tick rate
-            entity.server_x = entity.server_x + vx_sec * dt
-            entity.server_y = entity.server_y + vy_sec * dt
-            
-            local dx = entity.server_x - entity.x
-            local dy = entity.server_y - entity.y
-            local dist2 = dx * dx + dy * dy
-            
-            if dist2 > 2500.0 then
-                -- Strict snap (Rubberbanding > 50 units)
-                entity.x = entity.server_x
-                entity.y = entity.server_y
-            elseif dist2 > 0.01 then
-                -- Soft lerp smoothly tracking predicted position
-                entity.x = entity.x + dx * math.min(1.0, 15.0 * dt)
-                entity.y = entity.y + dy * math.min(1.0, 15.0 * dt)
+            entity.x = entity.server_x
+            entity.y = entity.server_y
+        end
+    end
+end
+
+function loci.update(dt)
+    local tick_rate = loci.server_tick_rate or 30.0
+    local now = loci._mock_time or socket.gettime()
+    local render_time = now - (loci.netcode.interpolation_delay or 0.050)
+
+    for _, entity in pairs(loci.entities) do
+        if loci.my_entity_id and entity.id == loci.my_entity_id then
+            -- Local player: (Phase 2 will implement Client-Side Prediction here)
+            local vx_sec = (entity.vx or 0) * tick_rate
+            local vy_sec = (entity.vy or 0) * tick_rate
+
+            if entity.server_x and entity.server_y then
+                entity.server_x = entity.server_x + vx_sec * dt
+                entity.server_y = entity.server_y + vy_sec * dt
+                
+                local dx = entity.server_x - entity.x
+                local dy = entity.server_y - entity.y
+                local dist2 = dx * dx + dy * dy
+                local snap_thresh = loci.netcode.snap_threshold or 50.0
+
+                if dist2 > (snap_thresh * snap_thresh) then
+                    entity.x = entity.server_x
+                    entity.y = entity.server_y
+                elseif dist2 > 0.01 then
+                    entity.x = entity.x + dx * math.min(1.0, 15.0 * dt)
+                    entity.y = entity.y + dy * math.min(1.0, 15.0 * dt)
+                else
+                    entity.x = entity.x + vx_sec * dt
+                    entity.y = entity.y + vy_sec * dt
+                end
             else
-                -- Just move with velocity
                 entity.x = entity.x + vx_sec * dt
                 entity.y = entity.y + vy_sec * dt
             end
         else
-            -- No server pos yet, just use vx/vy
-            entity.x = entity.x + vx_sec * dt
-            entity.y = entity.y + vy_sec * dt
+            -- Remote entities: Snapshot Interpolation (Phase 1 - ADR 0001)
+            loci._interpolate_remote_entity(entity, render_time, tick_rate)
         end
     end
+
+    if not loci._udp then return end
 
     local now = socket.gettime()
 
@@ -614,6 +741,25 @@ function loci._handle_world_state(state)
                 loci.on_action_cast(ent, act.ability_id, dir_x, dir_y)
             end
         end
+    end
+
+    -- Record snapshot in circular buffer for remote entity interpolation (Phase 1 - ADR 0001)
+    local snap_entities = {}
+    for id, ent in pairs(loci.entities) do
+        snap_entities[id] = {
+            x = ent.server_x or ent.x or 0,
+            y = ent.server_y or ent.y or 0,
+            vx = ent.vx or 0,
+            vy = ent.vy or 0
+        }
+    end
+    table.insert(loci._snapshot_buffer, {
+        tick = state.tick or 0,
+        receive_time = state._receive_time or socket.gettime(),
+        entities = snap_entities
+    })
+    while #loci._snapshot_buffer > (loci._max_snapshot_history or 20) do
+        table.remove(loci._snapshot_buffer, 1)
     end
 end
 

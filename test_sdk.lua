@@ -110,8 +110,16 @@ loci._handle_response({ status = "rejected: Stunned" })
 assert(intent_rejected_called, "on_intent_rejected must be triggered")
 
 -- Test version metadata
-assert(loci.VERSION == "0.6.1", "loci.VERSION should be 0.6.1")
+assert(loci.VERSION == "0.6.2", "loci.VERSION should be 0.6.2")
 assert(loci.COMPATIBLE_ENGINE_VERSION == "0.6.x", "loci.COMPATIBLE_ENGINE_VERSION should be 0.6.x")
+
+-- Test netcode configuration defaults (ADR 0001)
+assert(loci.netcode ~= nil, "loci.netcode table must exist")
+assert(loci.netcode.prediction_enabled == true, "prediction_enabled default must be true")
+assert(loci.netcode.interpolation_delay == 0.050, "interpolation_delay default must be 50ms")
+assert(loci.netcode.snap_threshold == 50.0, "snap_threshold default must be 50.0")
+assert(loci.netcode.reconciliation_threshold == 2.0, "reconciliation_threshold default must be 2.0")
+assert(type(loci.get_snapshot_buffer()) == "table", "get_snapshot_buffer must return a table")
 
 -- Test action helpers & position-to-direction conversion
 local last_sent_intent = nil
@@ -142,5 +150,91 @@ assert(last_sent_intent.action.target_direction.y_bits == 0, "y_bits should be 0
 loci.send_action_direction(4, 0, 1)
 assert(last_sent_intent.action.ability_id == 4, "ability_id must be 4")
 assert(last_sent_intent.action.target_direction.y_bits == 65536, "dy should be 1.0 (65536 bits)")
+
+-- ============================================================================
+-- Phase 1 Unit Tests: Snapshot Buffer & Remote Entity Interpolation
+-- ============================================================================
+
+-- Reset snapshot buffer
+loci._snapshot_buffer = {}
+
+-- Snapshot 1: Enemy Minion (entity 11) is at (10, 20) at t = 1.000
+local state_snap1 = {
+    tick = 10,
+    _receive_time = 1.000,
+    entities = {
+        {
+            id = 11,
+            name = "Enemy_Minion",
+            position = { x_bits = 65536 * 10, y_bits = 65536 * 20 },
+            velocity = { x_bits = 65536 * 2, y_bits = 65536 * 2 },
+            properties = {}
+        }
+    }
+}
+loci._handle_world_state(state_snap1)
+
+-- Snapshot 2: Enemy Minion moved to (30, 40) at t = 1.100 (100ms later)
+local state_snap2 = {
+    tick = 13,
+    _receive_time = 1.100,
+    entities = {
+        {
+            id = 11,
+            name = "Enemy_Minion",
+            position = { x_bits = 65536 * 30, y_bits = 65536 * 40 },
+            velocity = { x_bits = 65536 * 2, y_bits = 65536 * 2 },
+            properties = {}
+        }
+    }
+}
+loci._handle_world_state(state_snap2)
+
+assert(#loci.get_snapshot_buffer() == 2, "snapshot buffer should hold 2 snapshots")
+
+-- Test midpoint interpolation:
+-- If mock_time = 1.100 and interpolation_delay = 0.050 (50ms):
+-- render_time = 1.100 - 0.050 = 1.050 (exactly midpoint between 1.000 and 1.100, alpha = 0.5)
+loci.netcode.interpolation_delay = 0.050
+loci._mock_time = 1.100
+loci.update(0.016)
+
+local minion = loci.entities[11]
+assert(minion ~= nil, "minion should exist in loci.entities")
+assert(math.abs(minion.x - 20.0) < 0.001, "remote entity x should interpolate to 20.0 at alpha=0.5, got " .. tostring(minion.x))
+assert(math.abs(minion.y - 30.0) < 0.001, "remote entity y should interpolate to 30.0 at alpha=0.5, got " .. tostring(minion.y))
+
+-- Test 25% interpolation (alpha = 0.25):
+-- render_time = 1.025 -> x = 10 + 20 * 0.25 = 15.0; y = 20 + 20 * 0.25 = 25.0
+loci._mock_time = 1.075
+loci.update(0.016)
+assert(math.abs(minion.x - 15.0) < 0.001, "remote entity x should interpolate to 15.0 at alpha=0.25, got " .. tostring(minion.x))
+assert(math.abs(minion.y - 25.0) < 0.001, "remote entity y should interpolate to 25.0 at alpha=0.25, got " .. tostring(minion.y))
+
+-- Test teleport/snap behavior when distance exceeds snap_threshold (>50px)
+local state_snap3_teleport = {
+    tick = 16,
+    _receive_time = 1.200,
+    entities = {
+        {
+            id = 11,
+            name = "Enemy_Minion",
+            position = { x_bits = 65536 * 200, y_bits = 65536 * 200 }, -- Teleported 170+ units away
+            velocity = { x_bits = 0, y_bits = 0 },
+            properties = {}
+        }
+    }
+}
+loci._handle_world_state(state_snap3_teleport)
+
+-- Render between snap2 (30, 40 at t=1.100) and snap3 (200, 200 at t=1.200)
+-- At alpha = 0.6 (render_time = 1.160), since dist > 50, it snaps directly to (200, 200) rather than sliding
+loci._mock_time = 1.210 -- render_time = 1.160 (alpha = 0.60)
+loci.update(0.016)
+assert(minion.x == 200, "teleported entity should snap to 200 on alpha >= 0.5 without sliding, got " .. tostring(minion.x))
+assert(minion.y == 200, "teleported entity should snap to 200 on alpha >= 0.5 without sliding, got " .. tostring(minion.y))
+
+-- Reset mock time
+loci._mock_time = nil
 
 print("All loci_client.lua SDK unit tests passed successfully!")
