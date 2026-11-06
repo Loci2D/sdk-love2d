@@ -54,6 +54,18 @@ else
     print("Install lua-protobuf (e.g. via luarocks install lua-protobuf) to run full binary Protobuf encoding.")
 end
 
+-- Load NetworkStats telemetry module
+local NetworkStats = nil
+local ok_netstats, res_netstats = pcall(require, "network_stats")
+if ok_netstats then
+    NetworkStats = res_netstats
+else
+    local ok_lib_ns, res_lib_ns = pcall(require, "lib.network_stats")
+    if ok_lib_ns then
+        NetworkStats = res_lib_ns
+    end
+end
+
 local function bits_to_float(bits)
     if not bits then return 0.0 end
     return bits / 65536.0
@@ -163,7 +175,13 @@ loci = {
         -- Diagnostic & synthetic testing
         simulate_packet_loss = 0.0,       -- 0.0 to 1.0 (e.g. 0.15 = 15% random drop)
         simulate_latency = 0.0,           -- Simulated delay in seconds (e.g. 0.050 = 50ms)
+        auto_export_csv_on_quit = true,   -- Automatically export network telemetry CSV on disconnect/quit
+        telemetry_window_size = 120,      -- Rolling window size for RTT / Jitter (Zero-GC circular buffer)
     },
+
+    -- Network Telemetry & Debug HUD
+    show_debug_overlay = false,
+    network_stats = NetworkStats and NetworkStats.new({ capacity = 120 }) or nil,
 
     -- Callbacks
     on_entity_spawned = function(entity) end,
@@ -195,6 +213,7 @@ loci = {
     _prediction_handler = nil,
     _active_move_dx = 0,
     _active_move_dy = 0,
+    _inflight_intents = {},
 }
 
 function loci.get_server_tick_rate()
@@ -327,6 +346,9 @@ function loci.connect(host, port, player_name, base_path, tick_rate)
 end
 
 function loci.disconnect(reason)
+    if loci.netcode and loci.netcode.auto_export_csv_on_quit then
+        pcall(function() loci.export_network_stats_csv() end)
+    end
     loci._snapshot_buffer = {}
     loci._active_move_dx = 0
     loci._active_move_dy = 0
@@ -334,6 +356,7 @@ function loci.disconnect(reason)
     loci._last_packet_received_time = nil
     loci._is_reconnecting = false
     loci._delayed_packet_queue = {}
+    loci._inflight_intents = {}
     if loci._udp then
         loci._send_intent({ disconnect = { reason = reason or "client closing" } })
         loci._udp:close()
@@ -345,9 +368,27 @@ function loci._send_intent(intent_table)
     if not pb or not loci._schema_loaded or not loci._udp then return end
 
     loci._sequence_id = loci._sequence_id + 1
+    local now = loci._mock_time or socket.gettime()
+    local now_ms = math.floor(now * 1000)
+
+    -- Track sent timestamp for Round-Trip Time (RTT) measurement
+    if not loci._inflight_intents then
+        loci._inflight_intents = {}
+    end
+    loci._inflight_intents[loci._sequence_id] = now
+
+    -- Periodic cleanup of unacknowledged inflight requests older than 5s
+    if loci._sequence_id % 64 == 0 then
+        for seq, t in pairs(loci._inflight_intents) do
+            if (now - t) > 5.0 then
+                loci._inflight_intents[seq] = nil
+            end
+        end
+    end
+
     local packet = {
         sequence_id = loci._sequence_id,
-        timestamp = math.floor(socket.gettime() * 1000),
+        timestamp = now_ms,
         intent = intent_table
     }
 
@@ -576,6 +617,19 @@ function loci._dispatch_raw_packet(data)
     if not loci._schema_loaded or not pb then return end
     local ok, packet = pcall(pb.decode, "loci2d.ServerPacket", data)
     if ok and packet then
+        local now = loci._mock_time or socket.gettime()
+
+        -- Measure RTT if this packet acknowledges an inflight intent sequence
+        local ack_seq = (packet.response and packet.response.sequence_id) or packet.sequence_id
+        if ack_seq and loci._inflight_intents and loci._inflight_intents[ack_seq] then
+            local send_t = loci._inflight_intents[ack_seq]
+            local rtt_ms = (now - send_t) * 1000.0
+            if loci.network_stats then
+                loci.network_stats:record_rtt(rtt_ms)
+            end
+            loci._inflight_intents[ack_seq] = nil
+        end
+
         if packet.world_state then
             loci._handle_world_state(packet.world_state)
         elseif packet.response then
@@ -783,6 +837,16 @@ function loci._handle_world_state(state)
     local now = state._receive_time or loci._mock_time or socket.gettime()
     loci._last_state_received_time = now
     loci._last_packet_received_time = now
+
+    -- Record snapshot into network telemetry
+    if loci.network_stats then
+        loci.network_stats:record_snapshot(state.tick, now)
+        local fps = 60.0
+        if love and love.timer and love.timer.getFPS then
+            fps = love.timer.getFPS()
+        end
+        loci.network_stats:record_telemetry_row(math.floor(now * 1000), state.tick, fps)
+    end
 
     -- Store globals with auto-type casting
     loci.globals = {}
@@ -1000,6 +1064,116 @@ function loci._handle_response(resp)
             local reason = string.sub(resp.status, string.len(prefix) + 1)
             loci.on_intent_rejected(reason)
         end
+    end
+end
+
+-- ============================================================================
+-- Network Telemetry & Debug APIs (RFC 3550, RTT, Loss & Overlay)
+-- ============================================================================
+
+function loci.get_ping()
+    return loci.network_stats and loci.network_stats.rtt or 0
+end
+
+function loci.get_rtt()
+    return loci.get_ping()
+end
+
+function loci.get_jitter()
+    return loci.network_stats and loci.network_stats.jitter or 0
+end
+
+function loci.get_packet_loss()
+    return loci.network_stats and loci.network_stats.loss_pct or 0
+end
+
+function loci.get_tick_hz()
+    return loci.network_stats and loci.network_stats.tick_hz or 0
+end
+
+function loci.get_network_stats()
+    if loci.network_stats then
+        return loci.network_stats:get_stats()
+    end
+    return {}
+end
+
+function loci.record_rtt(rtt_ms)
+    if loci.network_stats then
+        loci.network_stats:record_rtt(rtt_ms)
+    end
+end
+
+function loci.toggle_debug_overlay()
+    loci.show_debug_overlay = not loci.show_debug_overlay
+    return loci.show_debug_overlay
+end
+
+function loci.draw_debug_overlay(x, y)
+    if not loci.show_debug_overlay then return end
+    if not love or not love.graphics then return end
+
+    x = x or 10
+    y = y or 10
+    local stats_str = loci.network_stats and loci.network_stats:get_summary_string() or "[REDE] Telemetria inativa"
+
+    local font = love.graphics.getFont()
+    local text_w = font and font:getWidth(stats_str) or 520
+    local text_h = font and font:getHeight() or 16
+    local pad_x = 8
+    local pad_y = 6
+    local box_w = text_w + pad_x * 2
+    local box_h = text_h + pad_y * 2
+
+    local r, g, b, a = love.graphics.getColor()
+
+    -- Semi-transparent dark background (Zero GC rendering)
+    love.graphics.setColor(0.05, 0.05, 0.05, 0.82)
+    love.graphics.rectangle("fill", x, y, box_w, box_h, 4, 4)
+
+    -- Subtle accent outline
+    love.graphics.setColor(0.2, 0.8, 0.4, 0.9)
+    love.graphics.rectangle("line", x, y, box_w, box_h, 4, 4)
+
+    -- Status text
+    love.graphics.setColor(1, 1, 1, 1)
+    love.graphics.print(stats_str, x + pad_x, y + pad_y)
+
+    -- Restore previous color state
+    love.graphics.setColor(r, g, b, a)
+end
+
+function loci.draw()
+    if loci.show_debug_overlay then
+        loci.draw_debug_overlay(10, 10)
+    end
+end
+
+function loci.export_network_stats_csv(filepath)
+    if loci.network_stats then
+        local path, count = loci.network_stats:export_csv(filepath)
+        if path then
+            print(string.format("[NetworkStats] Telemetry exported to: %s (%d snapshots)", path, count or 0))
+            return path
+        end
+    end
+    return nil
+end
+
+function loci.keypressed(key)
+    if key == "f3" then
+        loci.toggle_debug_overlay()
+        return true
+    elseif key == "f4" then
+        loci.export_network_stats_csv()
+        return true
+    end
+    return false
+end
+
+function loci.quit()
+    if loci.netcode and loci.netcode.auto_export_csv_on_quit then
+        loci.export_network_stats_csv()
     end
 end
 

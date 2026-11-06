@@ -122,6 +122,7 @@ assert(loci.netcode.reconciliation_threshold == 2.0, "reconciliation_threshold d
 assert(type(loci.get_snapshot_buffer()) == "table", "get_snapshot_buffer must return a table")
 
 -- Test action helpers & position-to-direction conversion
+local orig_send_intent = loci._send_intent
 local last_sent_intent = nil
 loci._send_intent = function(intent)
     last_sent_intent = intent
@@ -583,6 +584,162 @@ assert(dispatched_packets == 1, "packet must be delivered once simulated latency
 assert(#loci._delayed_packet_queue == 0, "queue must be drained")
 
 loci._dispatch_raw_packet = orig_dispatch
+loci._send_intent = orig_send_intent
+loci._udp = nil
+loci._mock_time = nil
+
+-- ============================================================================
+-- 5. Test Network Telemetry (NetworkStats, CircularBuffer, RFC 3550 & CSV)
+-- ============================================================================
+local NetworkStats = require("lib.network_stats")
+
+-- 5.1 CircularBuffer verification
+local cb = NetworkStats.CircularBuffer.new(4)
+assert(cb.capacity == 4, "buffer capacity must be 4")
+assert(cb.count == 0, "initial count must be 0")
+assert(#cb.data == 4, "pre-allocated data array must have length 4")
+
+cb:push(10)
+cb:push(20)
+local avg, min_v, max_v = cb:get_stats()
+assert(avg == 15, "average should be 15")
+assert(min_v == 10, "min should be 10")
+assert(max_v == 20, "max should be 20")
+
+-- Push beyond capacity to verify wrap-around
+cb:push(30)
+cb:push(40)
+cb:push(50) -- Evicts 10 (contains 50, 20, 30, 40)
+assert(cb.count == 4, "count must clamp to capacity 4")
+avg, min_v, max_v = cb:get_stats()
+assert(avg == (20 + 30 + 40 + 50) / 4, "average after wrap should be 35")
+assert(min_v == 20, "min should be 20")
+assert(max_v == 50, "max should be 50")
+
+-- 5.2 NetworkStats: RFC 3550 EWMA Jitter Filter & RTT
+local stats = NetworkStats.new({ capacity = 10, max_csv_rows = 50 })
+assert(stats.rtt == 0, "initial rtt should be 0")
+assert(stats.jitter == 0, "initial jitter should be 0")
+
+-- Sample 1: 40ms
+stats:record_rtt(40)
+assert(stats.rtt == 40, "rtt should be 40")
+assert(stats.jitter == 0, "first sample jitter must be 0")
+
+-- Sample 2: 56ms (difference D = 16ms)
+-- Formula: J_1 = J_0 + (16 - J_0)/16 = 0 + 16/16 = 1.0ms
+stats:record_rtt(56)
+assert(stats.rtt == 56, "rtt should be 56")
+assert(math.abs(stats.jitter - 1.0) < 0.001, "jitter should be 1.0ms according to RFC 3550")
+
+-- Sample 3: 56ms (difference D = 0ms)
+-- Formula: J_2 = 1.0 + (0 - 1.0)/16 = 1.0 - 0.0625 = 0.9375ms
+stats:record_rtt(56)
+assert(math.abs(stats.jitter - 0.9375) < 0.001, "jitter should decay smoothly to 0.9375ms")
+
+-- Verify RTT avg/min/max
+assert(stats.rtt_min == 40, "rtt_min should be 40")
+assert(stats.rtt_max == 56, "rtt_max should be 56")
+assert(math.abs(stats.rtt_avg - ((40 + 56 + 56) / 3)) < 0.001, "rtt_avg should be 50.666...")
+
+-- 5.3 Snapshot arrivals, Tick Delta, and Loss %
+-- Tick 1 arriving at t=1.000s
+stats:record_snapshot(1, 1.000)
+assert(stats.total_packets_received == 1, "total received should be 1")
+assert(stats.total_packets_expected == 1, "total expected should be 1")
+assert(stats.loss_pct == 0.0, "loss should be 0%")
+
+-- Tick 2 arriving at t=1.0333s (~33.3ms delta = 30 Hz)
+stats:record_snapshot(2, 1.0333)
+assert(stats.total_packets_received == 2, "total received should be 2")
+assert(stats.total_packets_expected == 2, "total expected should be 2")
+assert(stats.loss_pct == 0.0, "loss should still be 0%")
+assert(math.abs(stats.tick_hz - 30.03) < 0.5, "tick_hz should be ~30Hz")
+
+-- Tick 5 arriving at t=1.1333s (Ticks 3 and 4 were lost! delta = 3)
+stats:record_snapshot(5, 1.1333)
+-- received: 3, expected: 2 + 3 = 5 -> Loss = (1 - 3/5) * 100 = 40%
+assert(stats.total_packets_received == 3, "total received should be 3")
+assert(stats.total_packets_expected == 5, "total expected should be 5")
+assert(math.abs(stats.loss_pct - 40.0) < 0.001, "loss_pct should be 40% (2 lost out of 5)")
+
+-- Out-of-order packet arriving (tick 4 arrives after tick 5)
+stats:record_snapshot(4, 1.1400)
+assert(stats.out_of_order_count == 1, "out_of_order_count must increment to 1")
+
+-- 5.4 Summary string format check
+local summary = stats:get_summary_string()
+assert(string.find(summary, "%[REDE%]") ~= nil, "summary must contain '[REDE]' tag")
+assert(string.find(summary, "Ping:") ~= nil, "summary must contain 'Ping:'")
+assert(string.find(summary, "Jitter:") ~= nil, "summary must contain 'Jitter:'")
+assert(string.find(summary, "Loss: 40.0%%") ~= nil, "summary must contain 'Loss: 40.0%'")
+
+-- 5.5 Static Zero-GC CSV Row Logging & Export
+stats:record_telemetry_row(1000, 1, 60.0)
+stats:record_telemetry_row(1033, 2, 60.0)
+stats:record_telemetry_row(1133, 5, 59.5)
+assert(stats.csv_count == 3, "csv_count should be 3")
+
+local test_csv_path = "logs/test_network_stats.csv"
+local exported_path, row_count = stats:export_csv(test_csv_path)
+assert(exported_path == test_csv_path, "exported path should match")
+assert(row_count == 3, "row count should be 3")
+
+local f = io.open(test_csv_path, "r")
+assert(f ~= nil, "exported CSV file must exist on disk")
+local header = f:read("*line")
+assert(header == "client_time_ms,server_tick,rtt_ms,jitter_ms,delta_snapshot_ms,loss_pct,fps", "CSV header mismatch")
+local first_row = f:read("*line")
+assert(string.find(first_row, "^1000,1,") ~= nil, "first CSV row must match recorded data")
+f:close()
+os.remove(test_csv_path)
+
+-- 5.6 Integration with loci client facade
+assert(type(loci.get_ping) == "function", "loci.get_ping must exist")
+assert(type(loci.get_jitter) == "function", "loci.get_jitter must exist")
+assert(type(loci.get_packet_loss) == "function", "loci.get_packet_loss must exist")
+assert(type(loci.get_tick_hz) == "function", "loci.get_tick_hz must exist")
+assert(type(loci.toggle_debug_overlay) == "function", "loci.toggle_debug_overlay must exist")
+assert(type(loci.export_network_stats_csv) == "function", "loci.export_network_stats_csv must exist")
+
+loci.record_rtt(45.5)
+assert(loci.get_ping() == 45.5, "loci.get_ping() should return 45.5")
+assert(loci.get_rtt() == 45.5, "loci.get_rtt() should return 45.5")
+
+-- Test F3 key toggle
+assert(loci.show_debug_overlay == false, "overlay should be hidden initially")
+local consumed = loci.keypressed("f3")
+assert(consumed == true, "keypressed('f3') must consume the key event")
+assert(loci.show_debug_overlay == true, "f3 must toggle overlay to true")
+loci.keypressed("f3")
+assert(loci.show_debug_overlay == false, "second f3 must toggle overlay back to false")
+
+-- Test Inflight intent sequence RTT tracking
+local pb = require("pb")
+pb.loadfile("lib/game_packets.pb")
+
+loci._inflight_intents = {}
+loci._mock_time = 500.000
+loci._sequence_id = 99
+loci._udp = { send = function() end }
+loci._schema_loaded = true
+loci._send_intent({ move = { direction = { x_bits = 0, y_bits = 0 } } })
+local sent_seq = loci._sequence_id
+assert(loci._inflight_intents[sent_seq] == 500.000, "inflight intent must be timestamped at 500.000")
+
+-- Simulate server acknowledgment arriving 42ms later at t=500.042
+loci._mock_time = 500.042
+local mock_server_packet_bytes = pb.encode("loci2d.ServerPacket", {
+    sequence_id = sent_seq,
+    response = {
+        sequence_id = sent_seq,
+        status = "ok"
+    }
+})
+loci._dispatch_raw_packet(mock_server_packet_bytes)
+assert(math.abs(loci.get_ping() - 42.0) < 0.001, "RTT must be calculated as exactly 42.0ms from acknowledgment")
+assert(loci._inflight_intents[sent_seq] == nil, "inflight intent must be cleared upon acknowledgment")
+
 loci._udp = nil
 loci._mock_time = nil
 

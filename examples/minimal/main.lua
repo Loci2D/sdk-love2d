@@ -43,10 +43,15 @@ function love.mousepressed(x, y, button)
     end
 end
 
+function love.keypressed(key)
+    loci.keypressed(key)
+end
+
 function love.draw()
     love.graphics.setColor(1, 1, 1)
     love.graphics.print("Status: " .. status_text, 10, 10)
     love.graphics.print("Controls: WASD to move, Left-Click to cast ability", 10, 30)
+    love.graphics.print("Debug: [F3] Toggle Network HUD | [F4] Export CSV Log", 10, 50)
 
     local entities = loci.get_entities()
     for _, entity in ipairs(entities) do
@@ -59,8 +64,12 @@ function love.draw()
         love.graphics.setColor(1, 1, 1)
         love.graphics.print(entity.name or ("ID: " .. entity.id), entity.x - 20, entity.y - 30)
     end
+
+    -- Render network telemetry overlay if toggled with F3
+    loci.draw()
 end
 
 function love.quit()
+    loci.quit()
     loci.disconnect("Game closing")
 end
