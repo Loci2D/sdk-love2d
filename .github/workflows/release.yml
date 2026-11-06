@@ -177,6 +177,7 @@ jobs:
           cp lib/game_packets.proto package-bundle/loci2d/lib/
           cp lib/game_packets.pb package-bundle/loci2d/lib/
           cp lib/protoc.lua package-bundle/loci2d/lib/
+          cp lib/network_stats.lua package-bundle/loci2d/lib/
 
           # 2. Add native pre-compiled binaries
           cp downloaded-binaries/linux/pb.so package-bundle/loci2d/lib/

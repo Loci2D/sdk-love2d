@@ -97,11 +97,52 @@ function love.draw()
         end
         love.graphics.circle("fill", entity.x, entity.y, 16)
     end
+    -- Desenha overlay de telemetria se ativo (F3)
+    loci.draw()
+end
+
+function love.keypressed(key)
+    loci.keypressed(key) -- F3: Alterna HUD | F4: Exporta CSV
 end
 
 function love.quit()
+    loci.quit()
     loci.disconnect("Jogo fechado")
 end
 ```
+
+---
+
+## Telemetria de Rede e Validação Localhost (`tc`/`netem`)
+
+O SDK inclui telemetria de alta precisão e **Zero-GC** para medição de RTT, Jitter (RFC 3550), Perda de Pacotes e Frequência de Snapshots (Hz).
+
+* **F3**: Alterna a exibição do HUD em tela (`[REDE] Ping: 42ms (min: 35 | max: 85) | Jitter: 8.2ms | Loss: 1.2% | Tick: 30.1 Hz`).
+* **F4**: Exporta log bruto para `logs/network_stats_<timestamp>.csv`.
+* **Exportação ao Fechar**: Ocorre automaticamente no evento `loci.quit()`.
+
+### Simulação em Localhost (Linux `tc`/`netem`)
+
+Para validar as métricas em `127.0.0.1`, injete perturbações sintéticas no kernel do Linux:
+
+* **Wi-Fi Estável (40ms latência, ±5ms jitter, 0.5% perda):**
+  ```bash
+  sudo tc qdisc add dev lo root netem delay 40ms 5ms loss 0.5%
+  ```
+
+* **Wi-Fi Congestionado (80ms latência, ±25ms jitter, 5% perda):**
+  ```bash
+  sudo tc qdisc add dev lo root netem delay 80ms 25ms loss 5%
+  ```
+
+* **Rajadas e Reordenação (60ms latência, 25% pacotes fora de ordem):**
+  ```bash
+  sudo tc qdisc add dev lo root netem delay 60ms 10ms reorder 25% 50%
+  ```
+
+* **Restaurar Localhost Normal (remover regras):**
+  ```bash
+  sudo tc qdisc del dev lo root
+  ```
 
 Consulte a documentação completa em `docs/index.html` abrindo no seu navegador.
