@@ -63,6 +63,19 @@ else
     local ok_lib_ns, res_lib_ns = pcall(require, "lib.network_stats")
     if ok_lib_ns then
         NetworkStats = res_lib_ns
+    else
+        local candidates = {
+            "loci2d.lib.network_stats",
+            "client.loci2d.lib.network_stats",
+            (script_dir ~= "") and (script_dir:gsub("[/\\]", ".") .. "lib.network_stats") or nil
+        }
+        for _, mod in ipairs(candidates) do
+            local ok, res = pcall(require, mod)
+            if ok then
+                NetworkStats = res
+                break
+            end
+        end
     end
 end
 
@@ -620,7 +633,13 @@ function loci._dispatch_raw_packet(data)
         local now = loci._mock_time or socket.gettime()
 
         -- Measure RTT if this packet acknowledges an inflight intent sequence
-        local ack_seq = (packet.response and packet.response.sequence_id) or packet.sequence_id
+        local ack_seq = nil
+        if packet.response and packet.response.sequence_id and packet.response.sequence_id > 0 then
+            ack_seq = packet.response.sequence_id
+        elseif not packet.world_state and packet.sequence_id and packet.sequence_id > 0 then
+            ack_seq = packet.sequence_id
+        end
+
         if ack_seq and loci._inflight_intents and loci._inflight_intents[ack_seq] then
             local send_t = loci._inflight_intents[ack_seq]
             local rtt_ms = (now - send_t) * 1000.0

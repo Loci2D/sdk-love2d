@@ -225,15 +225,39 @@ function NetworkStats:export_csv(filepath)
         filepath = "logs/network_stats_" .. tostring(ts) .. ".csv"
     end
 
-    -- Ensure directory exists
+    -- Ensure directory exists cross-platform
     pcall(function()
-        if os.execute then
+        if love and love.filesystem and love.filesystem.createDirectory then
+            love.filesystem.createDirectory("logs")
+        elseif os.execute then
             os.execute("mkdir -p logs 2>/dev/null")
         end
     end)
 
     local file, err = io.open(filepath, "w")
     if not file then
+        if love and love.filesystem and love.filesystem.write then
+            local lines = { "client_time_ms,server_tick,rtt_ms,jitter_ms,delta_snapshot_ms,loss_pct,fps\n" }
+            local start_idx = (self.csv_count == self.max_csv_rows) and self.csv_index or 1
+            for i = 0, self.csv_count - 1 do
+                local idx = ((start_idx - 1 + i) % self.max_csv_rows) + 1
+                local row = self.csv_rows[idx]
+                table.insert(lines, string.format(
+                    "%d,%d,%.2f,%.2f,%.2f,%.2f,%.1f\n",
+                    row.client_time_ms,
+                    row.server_tick,
+                    row.rtt_ms,
+                    row.jitter_ms,
+                    row.delta_snapshot_ms,
+                    row.loss_pct,
+                    row.fps
+                ))
+            end
+            local ok, werr = love.filesystem.write(filepath, table.concat(lines))
+            if ok then
+                return filepath, self.csv_count
+            end
+        end
         return nil, "Could not open file for writing: " .. tostring(err)
     end
 
