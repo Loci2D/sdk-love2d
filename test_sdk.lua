@@ -274,6 +274,8 @@ hero.server_y = 100.0
 hero._error_x = 0
 hero._error_y = 0
 loci.server_tick_rate = 30.0
+local socket = require("socket")
+loci._last_state_received_time = socket.gettime()
 
 -- 1. Test immediate velocity update on send_move
 loci.send_move(1, 0)
@@ -395,7 +397,193 @@ loci.send_move(1, 0)
 loci.update(0.100)
 assert(custom_handler_called == true, "custom prediction handler must be called when set")
 assert(math.abs(hero.x - 309.9) < 0.001, "custom handler displacement should be applied")
-loci.set_prediction_handler(nil) -- reset hook
+loci.set_prediction_handler(nil)
 loci.send_move(0, 0)
+
+-- ============================================================================
+-- ADR 0002 Unit Tests: Netcode Resilience, Prediction Horizon & Reconnection
+-- ============================================================================
+
+-- 1. Test Prediction Horizon Cap (Starvation timeout)
+loci.netcode.prediction_timeout = 0.200
+hero.x = 500.0
+hero.y = 500.0
+hero.server_x = 500.0
+hero.server_y = 500.0
+hero.vx = 0
+hero.vy = 0
+hero._error_x = 0
+hero._error_y = 0
+
+loci._mock_time = 100.000
+local state_horizon_base = {
+    tick = 100,
+    _receive_time = 100.000,
+    entities = {
+        {
+            id = 10,
+            name = "Player_Hero",
+            position = { x_bits = math.floor(500.0 * 65536), y_bits = math.floor(500.0 * 65536) },
+            velocity = { x_bits = 0, y_bits = 0 },
+            properties = {}
+        }
+    }
+}
+loci._handle_world_state(state_horizon_base)
+assert(loci._last_state_received_time == 100.000, "state receive time should be 100.000")
+
+-- Start moving right at speed = 3.0 * 30 = 90 px/s
+loci.send_move(1, 0)
+
+-- At mock_time = 100.100 (100ms silence <= 200ms timeout): prediction active
+loci._mock_time = 100.100
+loci.update(0.100)
+-- 90 px/s * 0.1s = 9px -> x should advance to 509.0
+assert(math.abs(hero.x - 509.0) < 0.001, "hero.x should advance to 509.0 within prediction horizon, got " .. tostring(hero.x))
+
+-- At mock_time = 100.250 (250ms silence > 200ms timeout): prediction MUST starve to stop ghost walking
+loci._mock_time = 100.250
+loci.update(0.150)
+assert(hero.vx == 0, "hero.vx should freeze to 0 when prediction is starved, got " .. tostring(hero.vx))
+assert(hero.vy == 0, "hero.vy should be 0 when prediction is starved")
+assert(math.abs(hero.x - 509.0) < 0.001, "hero.x must NOT advance when prediction is starved, got " .. tostring(hero.x))
+
+-- At mock_time = 100.500 (500ms silence): still starved
+loci._mock_time = 100.500
+loci.update(0.250)
+assert(math.abs(hero.x - 509.0) < 0.001, "hero.x must remain frozen at 509.0 without new server state")
+
+-- Server communication recovers at t = 100.600
+local state_horizon_recover = {
+    tick = 118,
+    _receive_time = 100.600,
+    entities = {
+        {
+            id = 10,
+            name = "Player_Hero",
+            position = { x_bits = math.floor(509.0 * 65536), y_bits = math.floor(500.0 * 65536) },
+            velocity = { x_bits = 0, y_bits = 0 },
+            properties = {}
+        }
+    }
+}
+loci._handle_world_state(state_horizon_recover)
+assert(loci._last_state_received_time == 100.600, "state receive time updated to 100.600")
+
+-- Move again at t = 100.650 (50ms after recovery): prediction resumes!
+loci._mock_time = 100.650
+loci.update(0.050)
+-- 90 px/s * 0.05s = 4.5px -> x should advance to 513.5
+assert(math.abs(hero.x - 513.5) < 0.001, "hero.x should resume prediction upon snapshot recovery, got " .. tostring(hero.x))
+loci.send_move(0, 0)
+
+-- 2. Test Connection Watchdog & Automated Reconnection
+local connection_lost_event = nil
+local reconnected_event = nil
+loci.on_connection_lost = function(reason)
+    connection_lost_event = reason
+end
+loci.on_reconnected = function(entity_id)
+    reconnected_event = entity_id
+end
+
+loci._player_name = "Player_Hero"
+loci.my_entity_id = 10
+loci._last_packet_received_time = 200.000
+loci._last_state_received_time = 200.000
+loci.netcode.connection_timeout = 4.0
+loci._mock_time = 201.000
+
+-- Track intents sent by client
+local sent_intents = {}
+loci._send_intent = function(intent)
+    table.insert(sent_intents, intent)
+end
+loci._udp = {
+    receive = function(self, max_len)
+        return nil, "timeout"
+    end,
+    close = function(self) end
+}
+
+-- Update at 1.0s silence (< 4.0s timeout): no disconnect
+loci.update(0.100)
+assert(connection_lost_event == nil, "connection must not be lost at 1.0s silence")
+assert(loci.my_entity_id == 10, "my_entity_id must still be 10")
+
+-- Fast forward to 204.500 (4.5s silence > 4.0s timeout): Watchdog triggers disconnect & auto-reconnect
+loci._mock_time = 204.500
+loci.update(0.100)
+
+assert(connection_lost_event == "heartbeat timeout", "on_connection_lost must fire with heartbeat timeout, got: " .. tostring(connection_lost_event))
+assert(loci.my_entity_id == nil, "my_entity_id must be cleared on disconnect")
+assert(loci._is_reconnecting == true, "client must transition to _is_reconnecting state")
+assert(#sent_intents > 0, "client must emit join intent during auto-reconnection")
+
+-- Server accepts reconnection and sends WorldState with player restored (id = 77)
+local state_reconnected = {
+    tick = 300,
+    _receive_time = 205.000,
+    entities = {
+        {
+            id = 77,
+            name = "Player_Hero",
+            position = { x_bits = math.floor(100.0 * 65536), y_bits = math.floor(100.0 * 65536) },
+            velocity = { x_bits = 0, y_bits = 0 },
+            properties = {}
+        }
+    }
+}
+loci._handle_world_state(state_reconnected)
+
+assert(loci.my_entity_id == 77, "my_entity_id must be restored to 77")
+assert(loci._is_reconnecting == false, "_is_reconnecting must be false after reconnection")
+assert(reconnected_event == 77, "on_reconnected callback must receive restored entity_id 77")
+
+-- 3. Test Accelerated Heartbeat Cadence (400ms)
+assert(loci.netcode.heartbeat_interval == 0.400, "heartbeat_interval must default to 0.400s")
+sent_intents = {}
+loci._last_heartbeat_time = 300.000
+loci._last_packet_received_time = 300.000
+loci._mock_time = 300.350 -- 350ms elapsed (< 400ms)
+loci.update(0.016)
+assert(#sent_intents == 0, "heartbeat must not fire before 400ms elapsed")
+
+loci._mock_time = 300.410 -- 410ms elapsed (> 400ms)
+loci.update(0.016)
+assert(#sent_intents > 0, "heartbeat must fire once 400ms interval elapses")
+assert(loci._last_heartbeat_time == 300.410, "last_heartbeat_time must update to 300.410")
+
+-- 4. Test Synthetic Network Simulator (Latency Delay Queue)
+loci._delayed_packet_queue = {}
+local dispatched_packets = 0
+local orig_dispatch = loci._dispatch_raw_packet
+loci._dispatch_raw_packet = function(data)
+    dispatched_packets = dispatched_packets + 1
+end
+
+loci.netcode.simulate_latency = 0.050 -- 50ms delay
+loci._mock_time = 400.000
+-- Enqueue packet at t = 400.000
+table.insert(loci._delayed_packet_queue, {
+    deliver_at = 400.050,
+    data = "mock_packet_bytes"
+})
+
+-- Update at t = 400.030 (30ms elapsed < 50ms): packet must stay queued
+loci._mock_time = 400.030
+loci.update(0.016)
+assert(dispatched_packets == 0, "packet must not be dispatched before simulated latency expires")
+assert(#loci._delayed_packet_queue == 1, "packet must remain in queue")
+
+-- Update at t = 400.060 (60ms elapsed >= 50ms): packet must be delivered
+loci._mock_time = 400.060
+loci.update(0.016)
+assert(dispatched_packets == 1, "packet must be delivered once simulated latency expires")
+assert(#loci._delayed_packet_queue == 0, "queue must be drained")
+
+loci._dispatch_raw_packet = orig_dispatch
+loci._udp = nil
+loci._mock_time = nil
 
 print("All loci_client.lua SDK unit tests passed successfully!")

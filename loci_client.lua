@@ -145,7 +145,7 @@ loci = {
     match_winner = "",
     server_tick_rate = tonumber(os.getenv and (os.getenv("LOCI_TICK_RATE") or os.getenv("TICK_RATE"))) or 30.0,
 
-    -- Netcode & Latency Compensation Configuration (ADR 0001)
+    -- Netcode & Latency Compensation Configuration (ADR 0001 & ADR 0002)
     netcode = {
         prediction_enabled = true,
         interpolation_delay = 0.050,      -- 50ms buffer (safe for 30Hz LAN Wi-Fi)
@@ -153,6 +153,16 @@ loci = {
         snap_threshold = 50.0,             -- 50px max error before hard snap
         error_decay_rate = 15.0,           -- Exponential error smoothing
         default_move_speed = 3.0,          -- Default units/tick
+
+        -- Resilience & Reconnection (ADR 0002)
+        prediction_timeout = 0.200,       -- 200ms max silence before pausing prediction (stops ghosting)
+        heartbeat_interval = 0.400,       -- 400ms heartbeat cadence (~2.5 pings/sec)
+        connection_timeout = 4.0,         -- 4.0s silence threshold before declaring disconnect
+        auto_reconnect = true,            -- Automatically re-join session upon packet loss eviction
+
+        -- Diagnostic & synthetic testing
+        simulate_packet_loss = 0.0,       -- 0.0 to 1.0 (e.g. 0.15 = 15% random drop)
+        simulate_latency = 0.0,           -- Simulated delay in seconds (e.g. 0.050 = 50ms)
     },
 
     -- Callbacks
@@ -162,6 +172,8 @@ loci = {
     on_match_state_changed = function(state, winner) end,
     on_action_cast = function(entity, ability_id, dir_x, dir_y) end,
     on_intent_rejected = function(reason) end,
+    on_connection_lost = function(reason) end,
+    on_reconnected = function(entity_id) end,
     
     -- Internal
     _udp = nil,
@@ -171,6 +183,10 @@ loci = {
     _last_join_attempt_time = 0,
     _last_state_tick = nil,
     _last_state_timestamp = nil,
+    _last_state_received_time = nil,
+    _last_packet_received_time = nil,
+    _is_reconnecting = false,
+    _delayed_packet_queue = {},
     _player_name = nil,
     _base_path = "lib/",
     _entities_list_cache = nil,
@@ -204,6 +220,12 @@ function loci.connect(host, port, player_name, base_path, tick_rate)
     loci._snapshot_buffer = {}
     loci._active_move_dx = 0
     loci._active_move_dy = 0
+    loci._last_state_received_time = nil
+    loci._last_packet_received_time = nil
+    loci._is_reconnecting = false
+    loci._delayed_packet_queue = {}
+    loci._last_heartbeat_time = 0
+    loci._last_join_attempt_time = 0
     if base_path then
         loci._base_path = base_path
     end
@@ -308,6 +330,10 @@ function loci.disconnect(reason)
     loci._snapshot_buffer = {}
     loci._active_move_dx = 0
     loci._active_move_dy = 0
+    loci._last_state_received_time = nil
+    loci._last_packet_received_time = nil
+    loci._is_reconnecting = false
+    loci._delayed_packet_queue = {}
     if loci._udp then
         loci._send_intent({ disconnect = { reason = reason or "client closing" } })
         loci._udp:close()
@@ -546,15 +572,38 @@ function loci._interpolate_remote_entity(entity, render_time, tick_rate)
     end
 end
 
+function loci._dispatch_raw_packet(data)
+    if not loci._schema_loaded or not pb then return end
+    local ok, packet = pcall(pb.decode, "loci2d.ServerPacket", data)
+    if ok and packet then
+        if packet.world_state then
+            loci._handle_world_state(packet.world_state)
+        elseif packet.response then
+            loci._handle_response(packet.response)
+        end
+    elseif not ok then
+        print("[Error] pb.decode failed: " .. tostring(packet))
+    end
+end
+
 function loci.update(dt)
     local tick_rate = loci.server_tick_rate or 30.0
     local now = loci._mock_time or socket.gettime()
     local render_time = now - (loci.netcode.interpolation_delay or 0.050)
 
+    -- Check prediction starvation (ADR 0002 Prediction Horizon)
+    local pred_timeout = (loci.netcode and loci.netcode.prediction_timeout) or 0.200
+    local prediction_starved = false
+    if loci._last_state_received_time ~= nil then
+        if (now - loci._last_state_received_time) > pred_timeout then
+            prediction_starved = true
+        end
+    end
+
     for _, entity in pairs(loci.entities) do
         if loci.my_entity_id and entity.id == loci.my_entity_id then
             if loci.netcode and loci.netcode.prediction_enabled then
-                -- Client-Side Prediction (Phase 2 - ADR 0001)
+                -- Client-Side Prediction (Phase 2 - ADR 0001 & ADR 0002)
                 local is_dead_prop = entity:get("is_dead")
                 local is_dead = (is_dead_prop == "true" or is_dead_prop == true or is_dead_prop == 1 or is_dead_prop == "1")
                 local cur_tick = loci._last_state_tick or 0
@@ -563,7 +612,7 @@ function loci.update(dt)
                 local dashing_until = tonumber(entity:get("dashing_until")) or 0
                 local incapacitated = is_dead or (cur_tick < stunned_until) or (cur_tick < paralyzed_until)
 
-                if incapacitated then
+                if incapacitated or prediction_starved then
                     entity.vx = 0
                     entity.vy = 0
                 elseif cur_tick < dashing_until then
@@ -614,31 +663,36 @@ function loci.update(dt)
                 end
             else
                 -- Fallback when prediction is disabled: Lerp towards theoretical server position
-                local vx_sec = (entity.vx or 0) * tick_rate
-                local vy_sec = (entity.vy or 0) * tick_rate
+                if prediction_starved then
+                    entity.vx = 0
+                    entity.vy = 0
+                else
+                    local vx_sec = (entity.vx or 0) * tick_rate
+                    local vy_sec = (entity.vy or 0) * tick_rate
 
-                if entity.server_x and entity.server_y then
-                    entity.server_x = entity.server_x + vx_sec * dt
-                    entity.server_y = entity.server_y + vy_sec * dt
-                    
-                    local dx = entity.server_x - entity.x
-                    local dy = entity.server_y - entity.y
-                    local dist2 = dx * dx + dy * dy
-                    local snap_thresh = loci.netcode.snap_threshold or 50.0
+                    if entity.server_x and entity.server_y then
+                        entity.server_x = entity.server_x + vx_sec * dt
+                        entity.server_y = entity.server_y + vy_sec * dt
+                        
+                        local dx = entity.server_x - entity.x
+                        local dy = entity.server_y - entity.y
+                        local dist2 = dx * dx + dy * dy
+                        local snap_thresh = loci.netcode.snap_threshold or 50.0
 
-                    if dist2 > (snap_thresh * snap_thresh) then
-                        entity.x = entity.server_x
-                        entity.y = entity.server_y
-                    elseif dist2 > 0.01 then
-                        entity.x = entity.x + dx * math.min(1.0, 15.0 * dt)
-                        entity.y = entity.y + dy * math.min(1.0, 15.0 * dt)
+                        if dist2 > (snap_thresh * snap_thresh) then
+                            entity.x = entity.server_x
+                            entity.y = entity.server_y
+                        elseif dist2 > 0.01 then
+                            entity.x = entity.x + dx * math.min(1.0, 15.0 * dt)
+                            entity.y = entity.y + dy * math.min(1.0, 15.0 * dt)
+                        else
+                            entity.x = entity.x + vx_sec * dt
+                            entity.y = entity.y + vy_sec * dt
+                        end
                     else
                         entity.x = entity.x + vx_sec * dt
                         entity.y = entity.y + vy_sec * dt
                     end
-                else
-                    entity.x = entity.x + vx_sec * dt
-                    entity.y = entity.y + vy_sec * dt
                 end
             end
         else
@@ -649,20 +703,54 @@ function loci.update(dt)
 
     if not loci._udp then return end
 
-    local now = socket.gettime()
+    -- Connection Watchdog (ADR 0002)
+    local conn_timeout = (loci.netcode and loci.netcode.connection_timeout) or 4.0
+    if loci.my_entity_id ~= nil and loci._last_packet_received_time ~= nil then
+        if (now - loci._last_packet_received_time) > conn_timeout then
+            -- Declared disconnected due to silence
+            local old_id = loci.my_entity_id
+            loci.my_entity_id = nil
+            loci._snapshot_buffer = {}
+            loci._active_move_dx = 0
+            loci._active_move_dy = 0
+            loci._is_reconnecting = true
+            loci._last_join_attempt_time = now
+            if loci.on_connection_lost then
+                pcall(loci.on_connection_lost, "heartbeat timeout")
+            end
+            if loci.netcode and loci.netcode.auto_reconnect and loci._player_name then
+                loci._send_intent({ join = { player_name = loci._player_name, schema_version = loci.SCHEMA_VERSION } })
+            end
+        end
+    end
 
-    -- If we haven't been acknowledged yet (server not up / join lost), resend JoinIntent every 2s
+    -- Heartbeat / Join Intent cadence (ADR 0002: accelerated 400ms heartbeat)
+    local heartbeat_interval = (loci.netcode and loci.netcode.heartbeat_interval) or 0.400
     if loci.my_entity_id == nil and loci._player_name then
-        if now - loci._last_join_attempt_time >= 2.0 then
+        local retry_interval = loci._is_reconnecting and 1.0 or 2.0
+        if (now - loci._last_join_attempt_time) >= retry_interval then
             loci._last_join_attempt_time = now
             loci._send_intent({ join = { player_name = loci._player_name, schema_version = loci.SCHEMA_VERSION } })
         end
     else
-        -- Normal heartbeat ping once connected
-        if now - loci._last_heartbeat_time >= 2.0 then
+        -- Accelerated heartbeat ping once connected (ADR 0002)
+        if (now - loci._last_heartbeat_time) >= heartbeat_interval then
             loci._last_heartbeat_time = now
             loci._send_intent({ ping = {} })
         end
+    end
+
+    -- Process queued delayed packets (Synthetic Latency Simulator)
+    if loci._delayed_packet_queue and #loci._delayed_packet_queue > 0 then
+        local remaining = {}
+        for _, delayed in ipairs(loci._delayed_packet_queue) do
+            if now >= delayed.deliver_at then
+                loci._dispatch_raw_packet(delayed.data)
+            else
+                table.insert(remaining, delayed)
+            end
+        end
+        loci._delayed_packet_queue = remaining
     end
 
     while true do
@@ -671,22 +759,31 @@ function loci.update(dt)
             break
         end
 
-        if loci._schema_loaded then
-            local ok, packet = pcall(pb.decode, "loci2d.ServerPacket", data)
-            if ok and packet then
-                if packet.world_state then
-                    loci._handle_world_state(packet.world_state)
-                elseif packet.response then
-                    loci._handle_response(packet.response)
-                end
-            elseif not ok then
-                print("[Error] pb.decode failed: " .. tostring(packet))
+        loci._last_packet_received_time = now
+
+        -- Synthetic Packet Loss Simulator
+        local loss_rate = (loci.netcode and loci.netcode.simulate_packet_loss) or 0.0
+        if loss_rate > 0 and math.random() < loss_rate then
+            -- Intentionally dropped
+        else
+            local sim_latency = (loci.netcode and loci.netcode.simulate_latency) or 0.0
+            if sim_latency > 0 then
+                table.insert(loci._delayed_packet_queue, {
+                    deliver_at = now + sim_latency,
+                    data = data
+                })
+            else
+                loci._dispatch_raw_packet(data)
             end
         end
     end
 end
 
 function loci._handle_world_state(state)
+    local now = state._receive_time or loci._mock_time or socket.gettime()
+    loci._last_state_received_time = now
+    loci._last_packet_received_time = now
+
     -- Store globals with auto-type casting
     loci.globals = {}
     if state.globals then
@@ -738,6 +835,12 @@ function loci._handle_world_state(state)
             -- Detect my_entity
             if loci.my_entity_id == nil and raw_ent.name == loci._player_name then
                 loci.my_entity_id = raw_ent.id
+                if loci._is_reconnecting then
+                    loci._is_reconnecting = false
+                    if loci.on_reconnected then
+                        pcall(loci.on_reconnected, loci.my_entity_id)
+                    end
+                end
             end
             
             local ent = loci.entities[entity_id]
@@ -882,7 +985,7 @@ function loci._handle_world_state(state)
     end
     table.insert(loci._snapshot_buffer, {
         tick = state.tick or 0,
-        receive_time = state._receive_time or socket.gettime(),
+        receive_time = state._receive_time or loci._mock_time or socket.gettime(),
         entities = snap_entities
     })
     while #loci._snapshot_buffer > (loci._max_snapshot_history or 20) do
