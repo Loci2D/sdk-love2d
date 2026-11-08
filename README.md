@@ -10,13 +10,21 @@ The **Loci2D Love2D SDK** (`loci_client.lua`) is a high-level abstraction layer 
 
 ```text
 sdk-love2d/
-├── loci_client.lua        # Main client module (API Facade, State Manager, and Netcode)
+├── loci.lua               # Primary module entry point (`require("loci")`)
+├── loci_client.lua        # Backward-compatibility shim (`require("loci_client")`)
+├── loci/                  # Modular SDK implementation
+│   ├── init.lua           # Public API Facade & lifecycle manager
+│   ├── entity.lua         # Entity metatable, properties auto-casting, queries
+│   ├── network/           # Transport UDP, Protobuf schema, and protocol dispatch
+│   ├── netcode/           # Snapshot buffer, interpolation, prediction & reconciliation
+│   └── telemetry/         # Zero-GC RFC 3550 jitter, RTT, HUD overlay & CSV exporter
 ├── test_sdk.lua           # Unit test suite to validate the SDK locally
 ├── AI_REFERENCE.md        # Compact API reference formatted for LLMs / AI Agents
 ├── lib/
 │   ├── game_packets.proto # Loci2D Protobuf packet definitions
 │   ├── game_packets.pb    # Pre-compiled binary descriptor (ultra-fast loading)
-│   └── protoc.lua         # Pure-Lua Protobuf parser (fallback for runtime dynamic parsing)
+│   ├── protoc.lua         # Pure-Lua Protobuf parser (fallback for runtime dynamic parsing)
+│   └── network_stats.lua  # Backward-compatibility shim for telemetry
 └── docs/
     ├── index.html         # Interactive visual guide for Love2D game development
     └── server_scripts.html# Guide for authoring server-side game rules

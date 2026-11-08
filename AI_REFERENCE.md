@@ -4,7 +4,7 @@
 
 ## Engine Architecture (For the AI)
 - `loci2d` is an authoritative Rust server that handles all physics, collisions, and state.
-- The developer is using the `loci_client.lua` SDK, which abstracts away all UDP sockets, Protocol Buffers, and network interpolation. **DO NOT generate any `luasocket` or `protobuf` code.**
+- The developer is using the `loci` (`loci_client.lua`) SDK, which abstracts away all UDP sockets, Protocol Buffers, and network interpolation. **DO NOT generate any `luasocket` or `protobuf` code.**
 - The server uses fixed-point math internally, but the SDK automatically converts this. **Always use standard Lua floats** for coordinates (`x`, `y`).
 - The SDK automatically manages the player's connection and session heartbeat.
 
