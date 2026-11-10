@@ -21,7 +21,7 @@ function transport_module.close_udp(udp)
     end
 end
 
-function transport_module.poll_network(ctx, now, on_dispatch_packet)
+function transport_module.poll_network(ctx, now, on_dispatch_packet, is_incapacitated)
     if not ctx._udp then return end
 
     -- 1. Connection Watchdog (ADR 0002)
@@ -32,6 +32,9 @@ function transport_module.poll_network(ctx, now, on_dispatch_packet)
             ctx._snapshot_buffer = {}
             ctx._active_move_dx = 0
             ctx._active_move_dy = 0
+            ctx._active_move_cleared_by_timeout = true
+            ctx._stop_redundancy_remaining = 0
+            ctx._was_incapacitated_with_move = false
             ctx._is_reconnecting = true
             ctx._last_join_attempt_time = now
             if ctx.on_connection_lost then
@@ -61,9 +64,64 @@ function transport_module.poll_network(ctx, now, on_dispatch_packet)
                 ctx._send_intent({ ping = {} })
             end
         end
+
+        -- 2b. MoveIntent Uplink Reliability (ADR 0003: Keepalive, CC recovery & stop redundancy)
+        local dx = ctx._active_move_dx or 0
+        local dy = ctx._active_move_dy or 0
+        if dx ~= 0 or dy ~= 0 then
+            if is_incapacitated then
+                -- Defer retransmission while dead/stunned/paralyzed to avoid rejection banner spam
+                ctx._was_incapacitated_with_move = true
+            else
+                local keepalive_interval = (ctx.netcode and ctx.netcode.intent_keepalive_interval) or 0.100
+                local should_resend = ctx._was_incapacitated_with_move == true
+                if not should_resend and keepalive_interval > 0 then
+                    if ctx._last_move_sent_time == nil or (now - ctx._last_move_sent_time) >= keepalive_interval then
+                        should_resend = true
+                    end
+                end
+                if should_resend then
+                    ctx._was_incapacitated_with_move = false
+                    ctx._last_move_sent_time = now
+                    if ctx._send_move_packet then
+                        ctx._send_move_packet(dx, dy)
+                    end
+                end
+            end
+        else
+            ctx._was_incapacitated_with_move = false
+            if (ctx._stop_redundancy_remaining or 0) > 0 then
+                local stop_age = now - (ctx._last_stop_send_time or 0)
+                if stop_age < 0 or stop_age > 0.5 then
+                    ctx._stop_redundancy_remaining = 0
+                elseif stop_age >= 0.030 then
+                    ctx._stop_redundancy_remaining = ctx._stop_redundancy_remaining - 1
+                    ctx._last_stop_send_time = now
+                    ctx._last_move_sent_time = now
+                    if ctx._send_move_packet then
+                        ctx._send_move_packet(0, 0)
+                    end
+                end
+            end
+        end
     end
 
-    -- 3. Process queued delayed packets (Synthetic Latency Simulator)
+    -- 3a. Flush queued delayed outbound packets (Symmetric Latency Simulator)
+    if ctx._delayed_outbound_queue and #ctx._delayed_outbound_queue > 0 then
+        local remaining_out = {}
+        for _, delayed in ipairs(ctx._delayed_outbound_queue) do
+            if now >= delayed.deliver_at then
+                if ctx._udp and ctx._udp.send then
+                    ctx._udp:send(delayed.data)
+                end
+            else
+                table.insert(remaining_out, delayed)
+            end
+        end
+        ctx._delayed_outbound_queue = remaining_out
+    end
+
+    -- 3b. Process queued delayed inbound packets (Synthetic Latency Simulator)
     if ctx._delayed_packet_queue and #ctx._delayed_packet_queue > 0 then
         local remaining = {}
         for _, delayed in ipairs(ctx._delayed_packet_queue) do

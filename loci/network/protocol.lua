@@ -23,6 +23,30 @@ function protocol_module.decode_server_packet(pb, data)
     return pcall(pb.decode, "loci2d.ServerPacket", data)
 end
 
+function protocol_module.deliver_encoded_packet(ctx, data, now_sec)
+    if not ctx._udp or not data then return end
+
+    local loss_rate = (ctx.netcode and ctx.netcode.simulate_packet_loss) or 0.0
+    if loss_rate > 0 and math.random() < loss_rate then
+        -- Intentionally dropped in synthetic uplink simulator
+        return
+    end
+
+    local sim_latency = (ctx.netcode and ctx.netcode.simulate_latency) or 0.0
+    if sim_latency > 0 then
+        local send_at = (now_sec or ctx._mock_time or socket.gettime()) + sim_latency
+        if not ctx._delayed_outbound_queue then
+            ctx._delayed_outbound_queue = {}
+        end
+        table.insert(ctx._delayed_outbound_queue, {
+            deliver_at = send_at,
+            data = data
+        })
+    else
+        ctx._udp:send(data)
+    end
+end
+
 function protocol_module.send_intent(ctx, schema, intent_table)
     local pb = schema.get_pb()
     if not pb or not ctx._schema_loaded or not ctx._udp then return end
@@ -37,7 +61,12 @@ function protocol_module.send_intent(ctx, schema, intent_table)
 
     local data = protocol_module.encode_game_packet(pb, ctx._sequence_id, now_sec, intent_table)
     if data then
-        ctx._udp:send(data)
+        -- Send disconnect bypasses synthetic delay queue since socket closes immediately
+        if intent_table and intent_table.disconnect ~= nil then
+            ctx._udp:send(data)
+        else
+            protocol_module.deliver_encoded_packet(ctx, data, now_sec)
+        end
     end
 end
 

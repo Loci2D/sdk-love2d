@@ -20,18 +20,25 @@ end
 
 function prediction_module.is_prediction_starved(last_state_received_time, now, timeout)
     if last_state_received_time == nil then return false end
-    timeout = timeout or 0.200
+    timeout = timeout or 0.500
     return (now - last_state_received_time) > timeout
+end
+
+function prediction_module.is_incapacitated(entity, cur_tick)
+    if not entity then return false end
+    cur_tick = cur_tick or 0
+    local is_dead_prop = entity:get("is_dead")
+    local is_dead = (is_dead_prop == "true" or is_dead_prop == true or is_dead_prop == 1 or is_dead_prop == "1")
+    if is_dead then return true end
+    local stunned_until = tonumber(entity:get("stunned_until")) or 0
+    local paralyzed_until = tonumber(entity:get("paralyzed_until")) or 0
+    return (cur_tick < stunned_until) or (cur_tick < paralyzed_until)
 end
 
 function prediction_module.predict_local_player(entity, ctx, dt, tick_rate, prediction_starved)
     local cur_tick = ctx._last_state_tick or 0
-    local is_dead_prop = entity:get("is_dead")
-    local is_dead = (is_dead_prop == "true" or is_dead_prop == true or is_dead_prop == 1 or is_dead_prop == "1")
-    local stunned_until = tonumber(entity:get("stunned_until")) or 0
-    local paralyzed_until = tonumber(entity:get("paralyzed_until")) or 0
     local dashing_until = tonumber(entity:get("dashing_until")) or 0
-    local incapacitated = is_dead or (cur_tick < stunned_until) or (cur_tick < paralyzed_until)
+    local incapacitated = prediction_module.is_incapacitated(entity, cur_tick)
 
     if incapacitated or prediction_starved then
         entity.vx = 0
@@ -63,8 +70,10 @@ function prediction_module.predict_local_player(entity, ctx, dt, tick_rate, pred
             entity.vx = ndx * move_speed
             entity.vy = ndy * move_speed
         else
-            entity.vx = 0
-            entity.vy = 0
+            if not ctx._active_move_cleared_by_timeout then
+                entity.vx = 0
+                entity.vy = 0
+            end
         end
     end
 end

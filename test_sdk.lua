@@ -110,7 +110,7 @@ loci._handle_response({ status = "rejected: Stunned" })
 assert(intent_rejected_called, "on_intent_rejected must be triggered")
 
 -- Test version metadata
-assert(loci.VERSION == "0.6.2", "loci.VERSION should be 0.6.2")
+assert(loci.VERSION == "0.6.3", "loci.VERSION should be 0.6.3")
 assert(loci.COMPATIBLE_ENGINE_VERSION == "0.6.x", "loci.COMPATIBLE_ENGINE_VERSION should be 0.6.x")
 
 -- Test netcode configuration defaults (ADR 0001)
@@ -119,6 +119,9 @@ assert(loci.netcode.prediction_enabled == true, "prediction_enabled default must
 assert(loci.netcode.interpolation_delay == 0.050, "interpolation_delay default must be 50ms")
 assert(loci.netcode.snap_threshold == 50.0, "snap_threshold default must be 50.0")
 assert(loci.netcode.reconciliation_threshold == 2.0, "reconciliation_threshold default must be 2.0")
+assert(loci.netcode.prediction_timeout == 0.500, "prediction_timeout default must be 0.500s")
+assert(loci.netcode.intent_keepalive_interval == 0.100, "intent_keepalive_interval default must be 0.100s")
+assert(loci.netcode.stop_redundancy_count == 3, "stop_redundancy_count default must be 3")
 assert(type(loci.get_snapshot_buffer()) == "table", "get_snapshot_buffer must return a table")
 
 -- Test action helpers & position-to-direction conversion
@@ -585,6 +588,10 @@ assert(#loci._delayed_packet_queue == 0, "queue must be drained")
 
 loci._dispatch_raw_packet = orig_dispatch
 loci._send_intent = orig_send_intent
+loci.netcode.simulate_latency = 0.0
+loci.netcode.simulate_packet_loss = 0.0
+loci.netcode.prediction_timeout = 0.500
+loci._delayed_outbound_queue = {}
 loci._udp = nil
 loci._mock_time = nil
 
@@ -759,7 +766,7 @@ loci._mock_time = nil
 -- 6.1 Direct require("loci") parity check
 local direct_loci = require("loci")
 assert(direct_loci == loci, "require('loci') must return the exact same instance as require('loci_client')")
-assert(direct_loci.VERSION == "0.6.2", "direct_loci.VERSION must be 0.6.2")
+assert(direct_loci.VERSION == "0.6.3", "direct_loci.VERSION must be 0.6.3")
 
 -- 6.2 Entity submodule direct test
 local entity_mod = require("loci.entity")
@@ -820,5 +827,191 @@ assert(type(overlay_submod.draw_overlay) == "function", "overlay.draw_overlay mu
 
 local exporter_submod = require("loci.telemetry.exporter")
 assert(type(exporter_submod.export_csv) == "function", "exporter.export_csv must be a function")
+
+-- ============================================================================
+-- 7. Test Uplink MoveIntent Resilience, Horizon Calibration & Symmetric Sim (Issue #6 / ADR 0003)
+-- ============================================================================
+assert(loci.netcode.prediction_timeout == 0.500, "prediction_timeout must default to 0.500s")
+assert(loci.netcode.intent_keepalive_interval == 0.100, "intent_keepalive_interval must default to 0.100s")
+assert(loci.netcode.stop_redundancy_count == 3, "stop_redundancy_count must default to 3")
+
+local s7_intents = {}
+local orig_s7_send = loci._send_intent
+loci._send_intent = function(intent)
+    table.insert(s7_intents, intent)
+end
+loci._udp = {
+    receive = function() return nil, "timeout" end,
+    send = function() end,
+    close = function() end
+}
+
+-- Setup local entity (id = 700)
+loci.my_entity_id = 700
+loci.entities = {
+    [700] = entity_mod.new_entity(700, "Player_S7")
+}
+local s7_ent = loci.entities[700]
+s7_ent.x = 0
+s7_ent.y = 0
+s7_ent.server_x = 0
+s7_ent.server_y = 0
+loci._player_name = "Player_S7"
+loci._last_state_tick = 100
+loci._mock_time = 1000.000
+loci._last_packet_received_time = 1000.000
+loci._last_state_received_time = 1000.000
+loci._last_heartbeat_time = 1000.000
+loci._active_move_dx = 0
+loci._active_move_dy = 0
+loci._stop_redundancy_remaining = 0
+loci._was_incapacitated_with_move = false
+loci._active_move_cleared_by_timeout = false
+
+-- 7.1 Active MoveIntent Keepalive (100ms) recovers from dropped initial UDP move packet
+loci.send_move(1, 0)
+assert(#s7_intents == 1 and s7_intents[1].move ~= nil, "initial send_move must emit move intent")
+
+-- Before 100ms keepalive (at +50ms): no duplicate move resend
+loci._mock_time = 1000.050
+loci.update(0.016)
+assert(#s7_intents == 1, "keepalive must not resend before 100ms interval")
+
+-- At +110ms: keepalive resends active move intent
+loci._mock_time = 1000.110
+loci.update(0.016)
+assert(#s7_intents == 2 and s7_intents[2].move ~= nil, "keepalive must resend active move after 100ms")
+
+-- 7.2 CC-aware keepalive pause & immediate recovery flush upon stun/death clearing
+s7_ent.properties["stunned_until"] = "150" -- active CC (> tick 100)
+loci._mock_time = 1000.300
+loci._last_packet_received_time = 1000.300
+loci._last_heartbeat_time = 1000.300
+loci.update(0.016)
+assert(#s7_intents == 2, "keepalive must pause during CC to prevent rejection spam")
+assert(loci._was_incapacitated_with_move == true, "must remember move intent was suppressed during CC")
+
+-- CC expires on tick 155 -> immediate automatic move resend on next update!
+loci._last_state_tick = 155
+s7_ent.properties["stunned_until"] = "0"
+loci._mock_time = 1000.320
+loci.update(0.016)
+assert(#s7_intents == 3 and s7_intents[3].move ~= nil, "must immediately flush active move intent once CC ends")
+assert(loci._was_incapacitated_with_move == false, "_was_incapacitated_with_move must reset after flush")
+
+-- 7.3 Stop redundancy burst emits extra (0, 0) packets and stops cleanly
+s7_intents = {}
+loci._mock_time = 1001.000
+loci._last_packet_received_time = 1001.000
+loci._last_heartbeat_time = 1001.000
+loci.send_move(0, 0)
+assert(#s7_intents == 1, "transition to stop emits first (0,0) packet")
+assert(s7_intents[1].move.direction.x_bits == 0 and s7_intents[1].move.direction.y_bits == 0, "stop direction must be (0,0)")
+
+loci._mock_time = 1001.035
+loci.update(0.016)
+assert(#s7_intents == 2, "stop redundancy emits 2nd packet after ~35ms")
+
+loci._mock_time = 1001.070
+loci.update(0.016)
+assert(#s7_intents == 3, "stop redundancy emits 3rd packet (total 3 = stop_redundancy_count)")
+
+loci._mock_time = 1001.110
+loci.update(0.016)
+assert(#s7_intents == 3, "must NOT emit idle stop packets beyond stop_redundancy_count")
+
+-- 7.4 500ms default prediction horizon absorbs 400ms Wi-Fi contention micro-stall
+s7_ent.x = 100.0
+s7_ent.y = 0.0
+loci.send_move(1, 0)
+loci._last_state_received_time = 1002.000
+loci._last_packet_received_time = 1002.000
+loci._last_heartbeat_time = 1002.000
+loci._mock_time = 1002.400 -- 400ms silence (< 500ms default horizon)
+loci.update(0.016)
+assert(s7_ent.vx > 0, "400ms micro-stall must NOT freeze prediction under 500ms default horizon")
+loci._mock_time = 1002.600 -- 600ms silence (> 500ms horizon)
+loci.update(0.016)
+assert(s7_ent.vx == 0 and s7_ent.vy == 0, "prediction must still stop beyond 500ms horizon")
+
+-- 7.5 Post-reconnect: entity populated inside on_reconnected & server_vx mirrored until resync
+loci._mock_time = 1008.000 -- > 4.0s timeout triggers disconnect
+loci.update(0.016)
+assert(loci.my_entity_id == nil, "watchdog clears my_entity_id on timeout")
+assert(loci._active_move_cleared_by_timeout == true, "_active_move_cleared_by_timeout must be true")
+
+local entity_available_in_callback = false
+local orig_reconnected_cb = loci.on_reconnected
+loci.on_reconnected = function(id)
+    local me = loci.get_my_entity()
+    entity_available_in_callback = (me ~= nil and me.id == id and me.x == 250)
+end
+loci._handle_world_state({
+    tick = 200,
+    _receive_time = 1008.200,
+    entities = {
+        {
+            id = 700,
+            name = "Player_S7",
+            position = { x_bits = 250 * 65536, y_bits = 0 },
+            velocity = { x_bits = 3 * 65536, y_bits = 0 },
+            properties = {}
+        }
+    }
+})
+assert(entity_available_in_callback == true, "get_my_entity() must return populated entity inside on_reconnected")
+assert(math.abs(s7_ent.vx - 3.0) < 0.001, "timeout-cleared velocity must mirror server_vx (3.0) until send_move resyncs")
+loci._mock_time = 1008.216
+loci.update(0.016)
+assert(math.abs(s7_ent.vx - 3.0) < 0.001, "update() must preserve mirrored server_vx while _active_move_cleared_by_timeout is active")
+
+-- Once consumer calls send_move(0, 0), timeout flag clears and vx zeroes cleanly
+loci.send_move(0, 0)
+assert(loci._active_move_cleared_by_timeout == false, "send_move clears timeout-cleared flag")
+assert(s7_ent.vx == 0, "explicit send_move(0, 0) sets vx = 0")
+
+-- 7.6 Symmetric outbound simulator in protocol + transport
+local udp_sent_packets = {}
+loci._send_intent = orig_s7_send
+loci._udp = {
+    send = function(self, data) table.insert(udp_sent_packets, data) end,
+    receive = function() return nil, "timeout" end,
+    close = function() end
+}
+loci._delayed_outbound_queue = {}
+loci.netcode.simulate_latency = 0.060
+loci.netcode.simulate_packet_loss = 0.0
+loci._mock_time = 1010.000
+loci._last_packet_received_time = 1010.000
+loci._last_state_received_time = 1010.000
+loci._last_heartbeat_time = 1010.000
+
+proto_submod.deliver_encoded_packet(loci, "outbound_move_bytes", 1010.000)
+assert(#udp_sent_packets == 0, "outbound packet must wait in queue during simulate_latency")
+assert(#loci._delayed_outbound_queue == 1, "_delayed_outbound_queue must hold delayed outbound packet")
+
+loci._mock_time = 1010.040
+loci.update(0.016)
+assert(#udp_sent_packets == 0, "outbound packet must not send before latency expires")
+
+loci._mock_time = 1010.070
+loci.update(0.016)
+assert(#udp_sent_packets == 1 and udp_sent_packets[1] == "outbound_move_bytes", "outbound packet must flush via transport after simulate_latency")
+assert(#loci._delayed_outbound_queue == 0, "_delayed_outbound_queue must be empty after flush")
+
+-- Outbound packet loss 100% drops packet cleanly
+loci.netcode.simulate_latency = 0.0
+loci.netcode.simulate_packet_loss = 1.0
+proto_submod.deliver_encoded_packet(loci, "dropped_outbound_bytes", 1010.100)
+assert(#udp_sent_packets == 1, "100% simulate_packet_loss must drop outbound packets symmetrically")
+
+-- Cleanup Section 7 state
+loci.netcode.simulate_packet_loss = 0.0
+loci.netcode.simulate_latency = 0.0
+loci._delayed_outbound_queue = {}
+loci._delayed_packet_queue = {}
+loci.on_reconnected = orig_reconnected_cb
+loci._udp = nil
+loci._mock_time = nil
 
 print("All loci_client.lua SDK unit tests passed successfully!")
