@@ -753,4 +753,72 @@ end
 loci._udp = nil
 loci._mock_time = nil
 
+-- ============================================================================
+-- 6. Test Modular Submodules & Backward-Compatibility Shim (Issue #3)
+-- ============================================================================
+-- 6.1 Direct require("loci") parity check
+local direct_loci = require("loci")
+assert(direct_loci == loci, "require('loci') must return the exact same instance as require('loci_client')")
+assert(direct_loci.VERSION == "0.6.2", "direct_loci.VERSION must be 0.6.2")
+
+-- 6.2 Entity submodule direct test
+local entity_mod = require("loci.entity")
+assert(type(entity_mod.new_entity) == "function", "entity_mod.new_entity must be a function")
+assert(type(entity_mod.cast_property_value) == "function", "entity_mod.cast_property_value must be a function")
+assert(entity_mod.cast_property_value("true") == true, "cast_property_value should parse booleans")
+assert(entity_mod.cast_property_value("42") == 42, "cast_property_value should parse numbers")
+assert(entity_mod.bits_to_float(65536) == 1.0, "bits_to_float should convert 65536 to 1.0")
+assert(entity_mod.float_to_bits(1.0) == 65536, "float_to_bits should convert 1.0 to 65536")
+
+local test_ent = entity_mod.new_entity(99, "Warrior")
+assert(test_ent.id == 99, "new entity id should match")
+assert(test_ent.blueprint == "Warrior", "new entity blueprint should match")
+
+-- 6.3 Netcode buffer submodule test
+local buffer_mod = require("loci.netcode.buffer")
+local test_buf = {}
+buffer_mod.record_snapshot(test_buf, 1, 10.0, { [99] = test_ent }, 5)
+assert(#test_buf == 1, "snapshot buffer must record 1 entry")
+assert(test_buf[1].tick == 1, "snapshot tick must be 1")
+assert(test_buf[1].entities[99] ~= nil, "snapshot must record entity 99")
+
+-- 6.4 Netcode interpolation submodule test
+local interp_mod = require("loci.netcode.interpolation")
+assert(type(interp_mod.interpolate_remote_entity) == "function", "interpolate_remote_entity must be a function")
+
+-- 6.5 Netcode prediction submodule test
+local pred_mod = require("loci.netcode.prediction")
+assert(type(pred_mod.update_immediate_velocity) == "function", "update_immediate_velocity must be a function")
+assert(type(pred_mod.is_prediction_starved) == "function", "is_prediction_starved must be a function")
+assert(pred_mod.is_prediction_starved(10.0, 10.3, 0.200) == true, "prediction should starve after timeout")
+assert(pred_mod.is_prediction_starved(10.0, 10.1, 0.200) == false, "prediction should not starve within timeout")
+
+-- 6.6 Netcode reconciler submodule test
+local recon_mod = require("loci.netcode.reconciler")
+local reconcile_ent = { x = 10, y = 10, _error_x = 0, _error_y = 0 }
+recon_mod.reconcile_position(reconcile_ent, 15, 10, 50.0, 2.0)
+assert(reconcile_ent._error_x == 5, "reconciler should record moderate delta for smoothing")
+recon_mod.decay_error(reconcile_ent, 0.1, 15.0)
+assert(reconcile_ent.x > 10, "entity x should advance during error decay")
+
+-- 6.7 Network schema & transport & protocol submodules test
+local schema_submod = require("loci.network.schema")
+assert(type(schema_submod.load) == "function", "schema.load must be a function")
+
+local proto_submod = require("loci.network.protocol")
+assert(type(proto_submod.handle_response) == "function", "protocol.handle_response must be a function")
+
+local transport_submod = require("loci.network.transport")
+assert(type(transport_submod.create_udp) == "function", "transport.create_udp must be a function")
+
+-- 6.8 Telemetry submodules test
+local stats_submod = require("loci.telemetry.stats")
+assert(type(stats_submod.new) == "function", "stats.new must be a function")
+
+local overlay_submod = require("loci.telemetry.overlay")
+assert(type(overlay_submod.draw_overlay) == "function", "overlay.draw_overlay must be a function")
+
+local exporter_submod = require("loci.telemetry.exporter")
+assert(type(exporter_submod.export_csv) == "function", "exporter.export_csv must be a function")
+
 print("All loci_client.lua SDK unit tests passed successfully!")

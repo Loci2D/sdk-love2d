@@ -10,13 +10,21 @@ O **Loci2D Love2D SDK** (`loci_client.lua`) é uma camada de abstração em alto
 
 ```text
 sdk-love2d/
-├── loci_client.lua       # Módulo principal do cliente (API Facade, State Manager e Netcode)
+├── loci.lua               # Ponto de entrada principal do módulo (`require("loci")`)
+├── loci_client.lua        # Shim de retrocompatibilidade (`require("loci_client")`)
+├── loci/                  # Implementação modular do SDK
+│   ├── init.lua           # Fachada pública da API e orquestrador
+│   ├── entity.lua         # Metatabela Entity, auto-casting de propriedades e queries
+│   ├── network/           # Transporte UDP, schema Protobuf e despacho de protocolos
+│   ├── netcode/           # Buffer de snapshots, interpolação, predição e reconciliação
+│   └── telemetry/         # Telemetria Zero-GC RFC 3550, RTT, overlay HUD e exportador CSV
 ├── test_sdk.lua          # Suíte de testes unitários para validar o SDK localmente
 ├── AI_REFERENCE.md       # Referência compacta de API formatada para LLMs/Agentes de IA
 ├── lib/
 │   ├── game_packets.proto # Definição dos pacotes Protobuf do Loci2D
 │   ├── game_packets.pb    # Descritor binário pré-compilado (carregamento ultra-rápido)
-│   └── protoc.lua         # Parser Protobuf puro em Lua (fallback para parsing dinâmico)
+│   ├── protoc.lua         # Parser Protobuf puro em Lua (fallback para parsing dinâmico)
+│   └── network_stats.lua  # Shim de retrocompatibilidade para telemetria
 └── docs/
     ├── index.html         # Guia visual interativo para desenvolvimento no Love2D
     └── server_scripts.html# Guia didático para criação de regras de jogo no servidor
