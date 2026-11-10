@@ -1,9 +1,9 @@
 # Technical Specification: Netcode Resilience, Prediction Horizon & Auto-Reconnection
-**Module:** `loci_client.lua` (`sdk-love2d`)  
+**Module:** `loci/init.lua` / `loci_client.lua` (`sdk-love2d`)  
 **Author:** Antigravity / Loci2D Team  
-**Status:** Draft / Accepted  
+**Status:** Accepted  
 **Compatibility:** `loci2d` v0.6.x+  
-**Architecture Record:** [ADR 0002](../adr/en/0002-netcode-packet-loss-resilience-and-auto-reconnect.md)  
+**Architecture Records:** [ADR 0002](../adr/en/0002-netcode-packet-loss-resilience-and-auto-reconnect.md), [ADR 0003](../adr/en/0003-uplink-intent-reliability-and-wifi-horizon-calibration.md)  
 **Related Spec:** [Latency & Jitter Compensation Spec](./latency-compensation-spec.md)
 
 ---
@@ -27,11 +27,11 @@ During physical multi-machine LAN Wi-Fi playtests (isolated from the external in
 
 To preserve 100% engine-agnostic reusability across any future LÖVE2D game built on `loci2d`:
 
-1. **Prediction Horizon (Timeout Cap):** Bound client-side prediction to a configurable short horizon (default `200ms`). If no authoritative snapshot arrives within this window, motion gracefully decays to zero.
+1. **Prediction Horizon (Timeout Cap):** Bound client-side prediction to a configurable horizon (default `500ms`, calibrated per ADR 0003 for Wi-Fi contention stalls). If no authoritative snapshot arrives within this window, motion gracefully decays to zero.
 2. **Accelerated Heartbeat Cadence:** Increase heartbeat frequency to `300ms–400ms` (~2.5–3.3 Hz). A client must withstand over 25 consecutive dropped packets before risking server timeout.
 3. **Client-Side Connection Watchdog:** If the client receives zero packets from the server for a threshold duration (default `4.0s`), declare connection loss, transition session state, and initiate automated re-join with exponential backoff.
 4. **Lifecycle Callbacks:** Expose optional event hooks (`on_connection_lost(reason)`, `on_reconnected(entity_id)`) so games can display standard UX indicators ("Reconnecting...", warning toasts) without SDK coupling.
-5. **Synthetic Network Simulator (DX):** Built-in optional artificial latency and packet loss injection in `loci.netcode` for local testing without needing OS-level traffic shaping tools (`tc/netem`, Clumsy).
+5. **Synthetic Network Simulator (DX):** Built-in optional artificial latency and packet loss injection in `loci.netcode` (applied symmetrically to inbound and outbound UDP packets per ADR 0003) for local testing without needing OS-level traffic shaping tools (`tc/netem`, Clumsy).
 
 ---
 
@@ -40,7 +40,7 @@ To preserve 100% engine-agnostic reusability across any future LÖVE2D game buil
 ```
               [ Connected & Healthy ]
                          │
-        (No packets received for > 200ms)
+        (No packets received for > 500ms)
                          │
                          ▼
              [ Prediction Starvation ]
@@ -75,11 +75,11 @@ To preserve 100% engine-agnostic reusability across any future LÖVE2D game buil
 
 ### 4.1. Prediction Horizon & Starvation Decoupling
 
-* **Configuration Parameter:** `loci.netcode.prediction_timeout` (default: `0.200` seconds / 200ms).
+* **Configuration Parameter:** `loci.netcode.prediction_timeout` (default: `0.500` seconds / 500ms).
 * **Tracking Variable:** `loci._last_state_received_time = socket.gettime()`, updated on every incoming `WorldState` packet.
 * **Logic in `loci.update(dt)`:**
   $$\Delta t_{\text{silence}} = \text{now} - \text{loci.\_last\_state\_received\_time}$$
-  * If $\Delta t_{\text{silence}} \le \text{prediction\_timeout}$: Apply normal prediction (or user prediction handler).
+  * If $\Delta t_{\text{silence}} \le \text{prediction\_timeout}$: Apply normal prediction (or user prediction handler), or mirror server velocity while `_active_move_cleared_by_timeout` awaits post-reconnect consumer `send_move`.
   * If $\Delta t_{\text{silence}} > \text{prediction\_timeout}$:
     * Force `entity.vx = 0`, `entity.vy = 0`.
     * Do not integrate positional displacement $\Delta x, \Delta y$.
@@ -93,28 +93,38 @@ To preserve 100% engine-agnostic reusability across any future LÖVE2D game buil
   * While connected (`my_entity_id ~= nil`), send `{ ping = {} }` every `heartbeat_interval`.
   * At 400ms interval, 25 packets must be dropped consecutively to trigger the server's 10-second timeout.
 
-### 4.3. Client Connection Watchdog & Auto-Reconnect
+### 4.3. Uplink `MoveIntent` Keepalive, CC Gating & Stop Redundancy (ADR 0003)
+
+* **Configuration Parameters:**
+  * `loci.netcode.intent_keepalive_interval` (default: `0.100` seconds / 100ms).
+  * `loci.netcode.stop_redundancy_count` (default: `3` total stop packets).
+* **Behavior:**
+  * **Active Movement Keepalive:** While `_active_move_dx ~= 0 or _active_move_dy ~= 0`, `poll_network` periodically retransmits the active `MoveIntent` every `intent_keepalive_interval` so dropped initial UDP packets self-heal within ~100ms.
+  * **Crowd-Control (CC) Awareness:** Periodic retransmissions pause while `prediction.is_incapacitated(ent, tick)` is true (`is_dead`, `stunned_until`, `paralyzed_until`) to avoid `on_intent_rejected` spam, setting `_was_incapacitated_with_move = true`. Immediately upon CC expiry, a single recovery `MoveIntent` flushes automatically.
+  * **Stop Redundancy Tail:** Transitioning from movement to `(0, 0)` on an active UDP socket emits up to `stop_redundancy_count - 1` extra `(0, 0)` datagrams spaced `>= 30ms` apart (bounded to `0.5s` elapsed since stop transition) so lost stop packets do not leave the server gliding.
+
+### 4.4. Client Connection Watchdog & Auto-Reconnect
 
 * **Configuration Parameter:** `loci.netcode.connection_timeout` (default: `4.0` seconds).
 * **Configuration Parameter:** `loci.netcode.auto_reconnect` (default: `true`).
 * **Behavior:**
-  * If `now - loci._last_state_received_time > loci.netcode.connection_timeout` while previously connected:
-    1. Mark connection as lost.
+  * If `now - loci._last_packet_received_time > loci.netcode.connection_timeout` (or `connection_timeout`) while previously connected:
+    1. Mark connection as lost and set `_active_move_cleared_by_timeout = true`.
     2. Notify application: `loci.on_connection_lost("heartbeat timeout")`.
     3. Clear `loci.my_entity_id = nil`, clear `loci._snapshot_buffer`.
     4. If `auto_reconnect == true`:
        - Trigger re-join sequence: emit `JoinIntent` with `loci._player_name`.
-       - Repeat every 1.0s until accepted or explicitly disconnected.
+       - Repeat with backoff until accepted or explicitly disconnected.
     5. Upon receiving `WorldState` containing player matching `_player_name`:
        - Restore `loci.my_entity_id = raw_ent.id`.
-       - Notify application: `loci.on_reconnected(loci.my_entity_id)`.
+       - Parse all snapshot entities first so `loci.get_my_entity()` is populated, then notify application: `loci.on_reconnected(loci.my_entity_id)`.
 
-### 4.4. Synthetic Latency & Loss Simulator (Developer Experience)
+### 4.5. Symmetric Synthetic Latency & Loss Simulator (Developer Experience)
 
 To enable developers to test packet loss and jitter behaviors locally without requiring specialized hardware or third-party packet shapers:
 
-* `loci.netcode.simulate_packet_loss`: Float between `0.0` (0%) and `1.0` (100%). When $> 0$, incoming UDP datagrams are randomly dropped with probability $p$.
-* `loci.netcode.simulate_latency`: Float in seconds (e.g. `0.050` for 50ms). When $> 0$, incoming packets are queued in a simulated delay pipeline before being delivered to `_handle_world_state`.
+* `loci.netcode.simulate_packet_loss`: Float between `0.0` (0%) and `1.0` (100%). When $> 0$, UDP datagrams are randomly dropped with probability $p$ symmetrically on both inbound (`transport.lua`) and outbound (`protocol.lua`, excluding `disconnect` shutdown packets) paths.
+* `loci.netcode.simulate_latency`: Float in seconds (e.g. `0.050` for 50ms). When $> 0$, inbound packets are queued in `_delayed_packet_queue` and outbound packets are queued in `_delayed_outbound_queue` before UDP delivery.
 
 ---
 
@@ -130,18 +140,20 @@ loci.netcode = {
     error_decay_rate = 15.0,
     default_move_speed = 3.0,
 
-    -- New Resilience & Reconnection settings
-    prediction_timeout = 0.200,       -- Max silence before pausing prediction (stops ghosting)
-    heartbeat_interval = 0.400,       -- Fast heartbeat ping cadence (2.5 pings/sec)
-    connection_timeout = 4.0,         -- Silence threshold before declaring disconnect
-    auto_reconnect = true,            -- Automatically re-join session upon packet loss eviction
+    -- Resilience, Uplink & Reconnection settings (ADR 0002 & ADR 0003)
+    prediction_timeout = 0.500,        -- Max silence before pausing prediction (absorbs Wi-Fi micro-stalls, stops ghosting)
+    intent_keepalive_interval = 0.100, -- Periodic MoveIntent retransmission cadence while moving
+    stop_redundancy_count = 3,         -- Total stop packets sent on transition to (0, 0)
+    heartbeat_interval = 0.400,        -- Fast heartbeat ping cadence (2.5 pings/sec)
+    connection_timeout = 4.0,          -- Silence threshold before declaring disconnect
+    auto_reconnect = true,             -- Automatically re-join session upon packet loss eviction
     
     -- Diagnostic / synthetic testing settings
-    simulate_packet_loss = 0.0,       -- 0.0 to 1.0 (e.g. 0.15 = 15% random drop)
-    simulate_latency = 0.0,           -- Simulated delay in seconds (e.g. 0.050 = 50ms)
+    simulate_packet_loss = 0.0,        -- 0.0 to 1.0 (symmetric inbound/outbound random drop)
+    simulate_latency = 0.0,            -- Simulated delay in seconds (symmetric inbound/outbound)
 }
 
--- New Application Callbacks
+-- Application Callbacks
 loci.on_connection_lost = function(reason) end
 loci.on_reconnected = function(entity_id) end
 ```

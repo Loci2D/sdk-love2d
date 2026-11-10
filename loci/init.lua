@@ -23,7 +23,7 @@ local exporter_mod = require(prefix .. "telemetry.exporter")
 
 local loci = {
     -- Metadata
-    VERSION = "0.6.2",
+    VERSION = "0.6.3",
     COMPATIBLE_ENGINE_VERSION = "0.6.x",
     SCHEMA_VERSION = 1,
     entities = {},
@@ -33,7 +33,7 @@ local loci = {
     match_winner = "",
     server_tick_rate = tonumber(os.getenv and (os.getenv("LOCI_TICK_RATE") or os.getenv("TICK_RATE"))) or 30.0,
 
-    -- Netcode & Latency Compensation Configuration (ADR 0001 & ADR 0002)
+    -- Netcode & Latency Compensation Configuration (ADR 0001, ADR 0002 & ADR 0003)
     netcode = {
         prediction_enabled = true,
         interpolation_delay = 0.050,      -- 50ms buffer (safe for 30Hz LAN Wi-Fi)
@@ -42,8 +42,10 @@ local loci = {
         error_decay_rate = 15.0,           -- Exponential error smoothing
         default_move_speed = 3.0,          -- Default units/tick
 
-        -- Resilience & Reconnection (ADR 0002)
-        prediction_timeout = 0.200,       -- 200ms max silence before pausing prediction (stops ghosting)
+        -- Resilience & Reconnection (ADR 0002 & ADR 0003)
+        prediction_timeout = 0.500,       -- 500ms max silence before pausing prediction (absorbs Wi-Fi micro-stalls, stops ghosting)
+        intent_keepalive_interval = 0.100,-- 100ms MoveIntent retransmission cadence while moving (UDP uplink reliability)
+        stop_redundancy_count = 3,        -- Redundant stop packets emitted on transition to (0, 0)
         heartbeat_interval = 0.400,       -- 400ms heartbeat cadence (~2.5 pings/sec)
         connection_timeout = 4.0,         -- 4.0s silence threshold before declaring disconnect
         auto_reconnect = true,            -- Automatically re-join session upon packet loss eviction
@@ -74,12 +76,18 @@ local loci = {
     _sequence_id = 0,
     _last_heartbeat_time = 0,
     _last_join_attempt_time = 0,
+    _last_move_sent_time = nil,
+    _last_stop_send_time = 0,
+    _stop_redundancy_remaining = 0,
+    _was_incapacitated_with_move = false,
+    _active_move_cleared_by_timeout = false,
     _last_state_tick = nil,
     _last_state_timestamp = nil,
     _last_state_received_time = nil,
     _last_packet_received_time = nil,
     _is_reconnecting = false,
     _delayed_packet_queue = {},
+    _delayed_outbound_queue = {},
     _player_name = nil,
     _base_path = "lib/",
     _entities_list_cache = nil,
@@ -117,10 +125,16 @@ function loci.connect(host, port, player_name, base_path, tick_rate)
     loci._snapshot_buffer = {}
     loci._active_move_dx = 0
     loci._active_move_dy = 0
+    loci._last_move_sent_time = nil
+    loci._last_stop_send_time = 0
+    loci._stop_redundancy_remaining = 0
+    loci._was_incapacitated_with_move = false
+    loci._active_move_cleared_by_timeout = false
     loci._last_state_received_time = nil
     loci._last_packet_received_time = nil
     loci._is_reconnecting = false
     loci._delayed_packet_queue = {}
+    loci._delayed_outbound_queue = {}
     loci._last_heartbeat_time = 0
     loci._last_join_attempt_time = 0
     loci._inflight_intents = {}
@@ -154,10 +168,16 @@ function loci.disconnect(reason)
     loci._snapshot_buffer = {}
     loci._active_move_dx = 0
     loci._active_move_dy = 0
+    loci._last_move_sent_time = nil
+    loci._last_stop_send_time = 0
+    loci._stop_redundancy_remaining = 0
+    loci._was_incapacitated_with_move = false
+    loci._active_move_cleared_by_timeout = false
     loci._last_state_received_time = nil
     loci._last_packet_received_time = nil
     loci._is_reconnecting = false
     loci._delayed_packet_queue = {}
+    loci._delayed_outbound_queue = {}
     loci._inflight_intents = {}
     if loci._udp then
         loci._send_intent({ disconnect = { reason = reason or "client closing" } })
@@ -170,11 +190,34 @@ function loci._send_intent(intent_table)
     protocol_mod.send_intent(loci, schema_mod, intent_table)
 end
 
+function loci._send_move_packet(dx, dy)
+    loci._send_intent({ move = { direction = { x_bits = entity_mod.float_to_bits(dx), y_bits = entity_mod.float_to_bits(dy) } } })
+end
+
 function loci.send_move(dir_x, dir_y)
     local dx = tonumber(dir_x) or 0
     local dy = tonumber(dir_y) or 0
+    local prev_dx = loci._active_move_dx or 0
+    local prev_dy = loci._active_move_dy or 0
     loci._active_move_dx = dx
     loci._active_move_dy = dy
+    loci._active_move_cleared_by_timeout = false
+    loci._was_incapacitated_with_move = false
+
+    local now_sec = loci._mock_time or socket.gettime()
+    loci._last_move_sent_time = now_sec
+
+    if dx == 0 and dy == 0 then
+        if loci._udp and (prev_dx ~= 0 or prev_dy ~= 0) then
+            local red_count = (loci.netcode and loci.netcode.stop_redundancy_count) or 3
+            loci._stop_redundancy_remaining = math.max(0, red_count - 1)
+            loci._last_stop_send_time = now_sec
+        else
+            loci._stop_redundancy_remaining = 0
+        end
+    else
+        loci._stop_redundancy_remaining = 0
+    end
 
     -- Immediate local velocity update for client prediction (Phase 2 - ADR 0001)
     if loci.netcode and loci.netcode.prediction_enabled and loci.my_entity_id then
@@ -184,7 +227,7 @@ function loci.send_move(dir_x, dir_y)
         end
     end
 
-    loci._send_intent({ move = { direction = { x_bits = entity_mod.float_to_bits(dx), y_bits = entity_mod.float_to_bits(dy) } } })
+    loci._send_move_packet(dx, dy)
 end
 
 function loci.send_action(ability_id, dir_x, dir_y)
@@ -250,12 +293,14 @@ function loci.update(dt)
     local now = loci._mock_time or socket.gettime()
     local render_time = now - ((loci.netcode and loci.netcode.interpolation_delay) or 0.050)
 
-    -- Check prediction starvation (ADR 0002 Prediction Horizon)
-    local pred_timeout = (loci.netcode and loci.netcode.prediction_timeout) or 0.200
+    -- Check prediction starvation (ADR 0002 & ADR 0003 Prediction Horizon)
+    local pred_timeout = (loci.netcode and loci.netcode.prediction_timeout) or 0.500
     local prediction_starved = pred_mod.is_prediction_starved(loci._last_state_received_time, now, pred_timeout)
+    local my_incapacitated = false
 
     for _, entity in pairs(loci.entities) do
         if loci.my_entity_id and entity.id == loci.my_entity_id then
+            my_incapacitated = pred_mod.is_incapacitated(entity, loci._last_state_tick or 0)
             if loci.netcode and loci.netcode.prediction_enabled then
                 pred_mod.predict_local_player(entity, loci, dt, tick_rate, prediction_starved)
                 recon_mod.decay_error(entity, dt, loci.netcode.error_decay_rate or 15.0)
@@ -271,7 +316,7 @@ function loci.update(dt)
 
     transport_mod.poll_network(loci, now, function(data)
         loci._dispatch_raw_packet(data)
-    end)
+    end, my_incapacitated)
 end
 
 function loci._handle_world_state(state)
@@ -293,19 +338,21 @@ function loci._handle_world_state(state)
     end
 
     -- Auto-detect server tick rate from authoritative timestamp and tick delta
-    if state.tick and state.timestamp and state.tick > 0 and state.timestamp > 0 then
-        if loci._last_state_tick and loci._last_state_timestamp then
-            local dticks = state.tick - loci._last_state_tick
-            local dtime = state.timestamp - loci._last_state_timestamp
-            if dticks > 0 and dtime > 0 then
-                local estimated_rate = math.floor((dticks * 1000.0 / dtime) + 0.5)
-                if estimated_rate >= 10 and estimated_rate <= 240 then
-                    loci.server_tick_rate = estimated_rate
+    if state.tick and state.tick > 0 then
+        if state.timestamp and state.timestamp > 0 then
+            if loci._last_state_tick and loci._last_state_timestamp then
+                local dticks = state.tick - loci._last_state_tick
+                local dtime = state.timestamp - loci._last_state_timestamp
+                if dticks > 0 and dtime > 0 then
+                    local estimated_rate = math.floor((dticks * 1000.0 / dtime) + 0.5)
+                    if estimated_rate >= 10 and estimated_rate <= 240 then
+                        loci.server_tick_rate = estimated_rate
+                    end
                 end
             end
+            loci._last_state_timestamp = state.timestamp
         end
         loci._last_state_tick = state.tick
-        loci._last_state_timestamp = state.timestamp
     end
 
     -- Feed NetworkStats telemetry (PR #2)
@@ -334,6 +381,7 @@ function loci._handle_world_state(state)
 
     -- Ingest and diff entities
     local new_entities = {}
+    local just_reconnected_id = nil
 
     if state.entities then
         for _, raw_ent in ipairs(state.entities) do
@@ -344,9 +392,7 @@ function loci._handle_world_state(state)
                 loci.my_entity_id = raw_ent.id
                 if loci._is_reconnecting then
                     loci._is_reconnecting = false
-                    if loci.on_reconnected then
-                        pcall(loci.on_reconnected, loci.my_entity_id)
-                    end
+                    just_reconnected_id = loci.my_entity_id
                 end
             end
 
@@ -374,20 +420,23 @@ function loci._handle_world_state(state)
                 ent.y = ent.y or 0
             end
 
-            -- Update Velocity (for interpolation)
+            -- Update Velocity (for interpolation, and timeout-cleared fallback until input resyncs)
+            local is_local_predicted = loci.my_entity_id and entity_id == loci.my_entity_id and loci.netcode and loci.netcode.prediction_enabled
+            local mirror_server_vel = (not is_local_predicted) or (loci._active_move_cleared_by_timeout == true and (loci._active_move_dx or 0) == 0 and (loci._active_move_dy or 0) == 0)
+
             if raw_ent.velocity then
                 local svx = entity_mod.bits_to_float(raw_ent.velocity.x_bits)
                 local svy = entity_mod.bits_to_float(raw_ent.velocity.y_bits)
                 ent.server_vx = svx
                 ent.server_vy = svy
-                if not (loci.my_entity_id and entity_id == loci.my_entity_id and loci.netcode and loci.netcode.prediction_enabled) then
+                if mirror_server_vel then
                     ent.vx = svx
                     ent.vy = svy
                 end
             else
                 ent.server_vx = 0
                 ent.server_vy = 0
-                if not (loci.my_entity_id and entity_id == loci.my_entity_id and loci.netcode and loci.netcode.prediction_enabled) then
+                if mirror_server_vel then
                     ent.vx = 0
                     ent.vy = 0
                 end
@@ -432,6 +481,10 @@ function loci._handle_world_state(state)
 
             new_entities[entity_id] = true
         end
+    end
+
+    if just_reconnected_id and loci.on_reconnected then
+        pcall(loci.on_reconnected, just_reconnected_id)
     end
 
     -- Despawn entities not in the new state
