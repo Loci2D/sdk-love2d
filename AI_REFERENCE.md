@@ -4,7 +4,7 @@
 
 ## Engine Architecture (For the AI)
 - `loci2d` is an authoritative Rust server that handles all physics, collisions, and state.
-- The developer is using the `loci_client.lua` SDK, which abstracts away all UDP sockets, Protocol Buffers, and network interpolation. **DO NOT generate any `luasocket` or `protobuf` code.**
+- The developer is using the `loci` (`loci_client.lua`) SDK, which abstracts away all UDP sockets, Protocol Buffers, and network interpolation. **DO NOT generate any `luasocket` or `protobuf` code.**
 - The server uses fixed-point math internally, but the SDK automatically converts this. **Always use standard Lua floats** for coordinates (`x`, `y`).
 - The SDK automatically manages the player's connection and session heartbeat.
 
@@ -51,6 +51,19 @@ When asked to implement a game feature:
 2. Map Love2D inputs (`love.keypressed`, `love.mousepressed`) directly to `loci.send_move` and `loci.send_action`.
 3. Read game state directly from `loci.get_entities()` inside `love.draw` to render the game. Do not maintain a separate list of game objects.
 
-### 6. Server-side scripting tips
+### 6. Network Telemetry & Debugging (ADR / Card Telemetria)
+Zero-GC telemetry monitoring for RTT, RFC 3550 Jitter, Packet Loss %, and Tick Frequency.
+- `loci.get_ping()` / `loci.get_rtt()` -> number: Current RTT in milliseconds.
+- `loci.get_jitter()` -> number: Current RFC 3550 EWMA jitter in milliseconds.
+- `loci.get_packet_loss()` -> number: Packet loss percentage (0.0 to 100.0).
+- `loci.get_tick_hz()` -> number: Measured server snapshot rate in Hz.
+- `loci.get_network_stats()` -> table: All aggregated metrics.
+- `loci.toggle_debug_overlay()`: Toggles the on-screen network telemetry HUD.
+- `loci.draw_debug_overlay(x, y)` / `loci.draw()`: Renders `[REDE] Ping: 42ms (min: 35 | max: 85) | Jitter: 8.2ms | Loss: 1.2% | Tick: 30.1 Hz`.
+- `loci.export_network_stats_csv([filepath])`: Exports telemetry to CSV (`logs/network_stats_<timestamp>.csv`).
+- `loci.keypressed(key)`: Handles `F3` (toggle overlay) and `F4` (export CSV).
+- `loci.quit()`: Flushes and exports telemetry on game exit.
+
+### 7. Server-side scripting tips
 - **Dash ability:** To implement a dash ability that passes through enemies but stops at walls, the server script should use `Loci.Physics.raycast` to find walls and `Loci.Commands.set_collision_filter` to temporarily ignore entities. Always remember to restore the original collision filter!
 

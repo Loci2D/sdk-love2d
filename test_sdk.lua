@@ -110,7 +110,7 @@ loci._handle_response({ status = "rejected: Stunned" })
 assert(intent_rejected_called, "on_intent_rejected must be triggered")
 
 -- Test version metadata
-assert(loci.VERSION == "0.6.2", "loci.VERSION should be 0.6.2")
+assert(loci.VERSION == "0.6.3", "loci.VERSION should be 0.6.3")
 assert(loci.COMPATIBLE_ENGINE_VERSION == "0.6.x", "loci.COMPATIBLE_ENGINE_VERSION should be 0.6.x")
 
 -- Test netcode configuration defaults (ADR 0001)
@@ -119,9 +119,13 @@ assert(loci.netcode.prediction_enabled == true, "prediction_enabled default must
 assert(loci.netcode.interpolation_delay == 0.050, "interpolation_delay default must be 50ms")
 assert(loci.netcode.snap_threshold == 50.0, "snap_threshold default must be 50.0")
 assert(loci.netcode.reconciliation_threshold == 2.0, "reconciliation_threshold default must be 2.0")
+assert(loci.netcode.prediction_timeout == 0.500, "prediction_timeout default must be 0.500s")
+assert(loci.netcode.intent_keepalive_interval == 0.100, "intent_keepalive_interval default must be 0.100s")
+assert(loci.netcode.stop_redundancy_count == 3, "stop_redundancy_count default must be 3")
 assert(type(loci.get_snapshot_buffer()) == "table", "get_snapshot_buffer must return a table")
 
 -- Test action helpers & position-to-direction conversion
+local orig_send_intent = loci._send_intent
 local last_sent_intent = nil
 loci._send_intent = function(intent)
     last_sent_intent = intent
@@ -583,6 +587,430 @@ assert(dispatched_packets == 1, "packet must be delivered once simulated latency
 assert(#loci._delayed_packet_queue == 0, "queue must be drained")
 
 loci._dispatch_raw_packet = orig_dispatch
+loci._send_intent = orig_send_intent
+loci.netcode.simulate_latency = 0.0
+loci.netcode.simulate_packet_loss = 0.0
+loci.netcode.prediction_timeout = 0.500
+loci._delayed_outbound_queue = {}
+loci._udp = nil
+loci._mock_time = nil
+
+-- ============================================================================
+-- 5. Test Network Telemetry (NetworkStats, CircularBuffer, RFC 3550 & CSV)
+-- ============================================================================
+local NetworkStats = require("lib.network_stats")
+
+-- 5.1 CircularBuffer verification
+local cb = NetworkStats.CircularBuffer.new(4)
+assert(cb.capacity == 4, "buffer capacity must be 4")
+assert(cb.count == 0, "initial count must be 0")
+assert(#cb.data == 4, "pre-allocated data array must have length 4")
+
+cb:push(10)
+cb:push(20)
+local avg, min_v, max_v = cb:get_stats()
+assert(avg == 15, "average should be 15")
+assert(min_v == 10, "min should be 10")
+assert(max_v == 20, "max should be 20")
+
+-- Push beyond capacity to verify wrap-around
+cb:push(30)
+cb:push(40)
+cb:push(50) -- Evicts 10 (contains 50, 20, 30, 40)
+assert(cb.count == 4, "count must clamp to capacity 4")
+avg, min_v, max_v = cb:get_stats()
+assert(avg == (20 + 30 + 40 + 50) / 4, "average after wrap should be 35")
+assert(min_v == 20, "min should be 20")
+assert(max_v == 50, "max should be 50")
+
+-- 5.2 NetworkStats: RFC 3550 EWMA Jitter Filter & RTT
+local stats = NetworkStats.new({ capacity = 10, max_csv_rows = 50 })
+assert(stats.rtt == 0, "initial rtt should be 0")
+assert(stats.jitter == 0, "initial jitter should be 0")
+
+-- Sample 1: 40ms
+stats:record_rtt(40)
+assert(stats.rtt == 40, "rtt should be 40")
+assert(stats.jitter == 0, "first sample jitter must be 0")
+
+-- Sample 2: 56ms (difference D = 16ms)
+-- Formula: J_1 = J_0 + (16 - J_0)/16 = 0 + 16/16 = 1.0ms
+stats:record_rtt(56)
+assert(stats.rtt == 56, "rtt should be 56")
+assert(math.abs(stats.jitter - 1.0) < 0.001, "jitter should be 1.0ms according to RFC 3550")
+
+-- Sample 3: 56ms (difference D = 0ms)
+-- Formula: J_2 = 1.0 + (0 - 1.0)/16 = 1.0 - 0.0625 = 0.9375ms
+stats:record_rtt(56)
+assert(math.abs(stats.jitter - 0.9375) < 0.001, "jitter should decay smoothly to 0.9375ms")
+
+-- Verify RTT avg/min/max
+assert(stats.rtt_min == 40, "rtt_min should be 40")
+assert(stats.rtt_max == 56, "rtt_max should be 56")
+assert(math.abs(stats.rtt_avg - ((40 + 56 + 56) / 3)) < 0.001, "rtt_avg should be 50.666...")
+
+-- 5.3 Snapshot arrivals, Tick Delta, and Loss %
+-- Tick 1 arriving at t=1.000s
+stats:record_snapshot(1, 1.000)
+assert(stats.total_packets_received == 1, "total received should be 1")
+assert(stats.total_packets_expected == 1, "total expected should be 1")
+assert(stats.loss_pct == 0.0, "loss should be 0%")
+
+-- Tick 2 arriving at t=1.0333s (~33.3ms delta = 30 Hz)
+stats:record_snapshot(2, 1.0333)
+assert(stats.total_packets_received == 2, "total received should be 2")
+assert(stats.total_packets_expected == 2, "total expected should be 2")
+assert(stats.loss_pct == 0.0, "loss should still be 0%")
+assert(math.abs(stats.tick_hz - 30.03) < 0.5, "tick_hz should be ~30Hz")
+
+-- Tick 5 arriving at t=1.1333s (Ticks 3 and 4 were lost! delta = 3)
+stats:record_snapshot(5, 1.1333)
+-- received: 3, expected: 2 + 3 = 5 -> Loss = (1 - 3/5) * 100 = 40%
+assert(stats.total_packets_received == 3, "total received should be 3")
+assert(stats.total_packets_expected == 5, "total expected should be 5")
+assert(math.abs(stats.loss_pct - 40.0) < 0.001, "loss_pct should be 40% (2 lost out of 5)")
+
+-- Out-of-order packet arriving (tick 4 arrives after tick 5)
+stats:record_snapshot(4, 1.1400)
+assert(stats.out_of_order_count == 1, "out_of_order_count must increment to 1")
+
+-- 5.4 Summary string format check
+local summary = stats:get_summary_string()
+assert(string.find(summary, "%[REDE%]") ~= nil, "summary must contain '[REDE]' tag")
+assert(string.find(summary, "Ping:") ~= nil, "summary must contain 'Ping:'")
+assert(string.find(summary, "Jitter:") ~= nil, "summary must contain 'Jitter:'")
+assert(string.find(summary, "Loss: 40.0%%") ~= nil, "summary must contain 'Loss: 40.0%'")
+
+-- 5.5 Static Zero-GC CSV Row Logging & Export
+stats:record_telemetry_row(1000, 1, 60.0)
+stats:record_telemetry_row(1033, 2, 60.0)
+stats:record_telemetry_row(1133, 5, 59.5)
+assert(stats.csv_count == 3, "csv_count should be 3")
+
+local test_csv_path = "logs/test_network_stats.csv"
+local exported_path, row_count = stats:export_csv(test_csv_path)
+assert(exported_path == test_csv_path, "exported path should match")
+assert(row_count == 3, "row count should be 3")
+
+local f = io.open(test_csv_path, "r")
+assert(f ~= nil, "exported CSV file must exist on disk")
+local header = f:read("*line")
+assert(header == "client_time_ms,server_tick,rtt_ms,jitter_ms,delta_snapshot_ms,loss_pct,fps", "CSV header mismatch")
+local first_row = f:read("*line")
+assert(string.find(first_row, "^1000,1,") ~= nil, "first CSV row must match recorded data")
+f:close()
+os.remove(test_csv_path)
+
+-- 5.6 Integration with loci client facade
+assert(type(loci.get_ping) == "function", "loci.get_ping must exist")
+assert(type(loci.get_jitter) == "function", "loci.get_jitter must exist")
+assert(type(loci.get_packet_loss) == "function", "loci.get_packet_loss must exist")
+assert(type(loci.get_tick_hz) == "function", "loci.get_tick_hz must exist")
+assert(type(loci.toggle_debug_overlay) == "function", "loci.toggle_debug_overlay must exist")
+assert(type(loci.export_network_stats_csv) == "function", "loci.export_network_stats_csv must exist")
+
+loci.record_rtt(45.5)
+assert(loci.get_ping() == 45.5, "loci.get_ping() should return 45.5")
+assert(loci.get_rtt() == 45.5, "loci.get_rtt() should return 45.5")
+
+-- Test F3 key toggle
+assert(loci.show_debug_overlay == false, "overlay should be hidden initially")
+local consumed = loci.keypressed("f3")
+assert(consumed == true, "keypressed('f3') must consume the key event")
+assert(loci.show_debug_overlay == true, "f3 must toggle overlay to true")
+loci.keypressed("f3")
+assert(loci.show_debug_overlay == false, "second f3 must toggle overlay back to false")
+
+-- Test Inflight intent sequence RTT tracking
+local ok_pb, pb = pcall(require, "pb")
+if ok_pb and pb then
+    pcall(function() pb.loadfile("lib/game_packets.pb") end)
+    loci._inflight_intents = {}
+    loci._mock_time = 500.000
+    loci._sequence_id = 99
+    loci._udp = { send = function() end }
+    loci._schema_loaded = true
+    loci._send_intent({ move = { direction = { x_bits = 0, y_bits = 0 } } })
+    local sent_seq = loci._sequence_id
+    assert(loci._inflight_intents[sent_seq] == 500.000, "inflight intent must be timestamped at 500.000")
+
+    -- Simulate server acknowledgment arriving 42ms later at t=500.042
+    loci._mock_time = 500.042
+    local mock_server_packet_bytes = pb.encode("loci2d.ServerPacket", {
+        sequence_id = sent_seq,
+        response = {
+            sequence_id = sent_seq,
+            status = "ok"
+        }
+    })
+    loci._dispatch_raw_packet(mock_server_packet_bytes)
+    assert(math.abs(loci.get_ping() - 42.0) < 0.001, "RTT must be calculated as exactly 42.0ms from acknowledgment")
+    assert(loci._inflight_intents[sent_seq] == nil, "inflight intent must be cleared upon acknowledgment")
+else
+    -- Fallback mode when native pb.so is not compiled yet: test inflight sequence and RTT recording
+    loci._inflight_intents = { [100] = 500.000 }
+    loci._mock_time = 500.042
+    local now = loci._mock_time
+    local send_t = loci._inflight_intents[100]
+    loci.record_rtt((now - send_t) * 1000.0)
+    loci._inflight_intents[100] = nil
+    assert(math.abs(loci.get_ping() - 42.0) < 0.001, "RTT must be calculated as 42.0ms in fallback")
+end
+
+loci._udp = nil
+loci._mock_time = nil
+
+-- ============================================================================
+-- 6. Test Modular Submodules & Backward-Compatibility Shim (Issue #3)
+-- ============================================================================
+-- 6.1 Direct require("loci") parity check
+local direct_loci = require("loci")
+assert(direct_loci == loci, "require('loci') must return the exact same instance as require('loci_client')")
+assert(direct_loci.VERSION == "0.6.3", "direct_loci.VERSION must be 0.6.3")
+
+-- 6.2 Entity submodule direct test
+local entity_mod = require("loci.entity")
+assert(type(entity_mod.new_entity) == "function", "entity_mod.new_entity must be a function")
+assert(type(entity_mod.cast_property_value) == "function", "entity_mod.cast_property_value must be a function")
+assert(entity_mod.cast_property_value("true") == true, "cast_property_value should parse booleans")
+assert(entity_mod.cast_property_value("42") == 42, "cast_property_value should parse numbers")
+assert(entity_mod.bits_to_float(65536) == 1.0, "bits_to_float should convert 65536 to 1.0")
+assert(entity_mod.float_to_bits(1.0) == 65536, "float_to_bits should convert 1.0 to 65536")
+
+local test_ent = entity_mod.new_entity(99, "Warrior")
+assert(test_ent.id == 99, "new entity id should match")
+assert(test_ent.blueprint == "Warrior", "new entity blueprint should match")
+
+-- 6.3 Netcode buffer submodule test
+local buffer_mod = require("loci.netcode.buffer")
+local test_buf = {}
+buffer_mod.record_snapshot(test_buf, 1, 10.0, { [99] = test_ent }, 5)
+assert(#test_buf == 1, "snapshot buffer must record 1 entry")
+assert(test_buf[1].tick == 1, "snapshot tick must be 1")
+assert(test_buf[1].entities[99] ~= nil, "snapshot must record entity 99")
+
+-- 6.4 Netcode interpolation submodule test
+local interp_mod = require("loci.netcode.interpolation")
+assert(type(interp_mod.interpolate_remote_entity) == "function", "interpolate_remote_entity must be a function")
+
+-- 6.5 Netcode prediction submodule test
+local pred_mod = require("loci.netcode.prediction")
+assert(type(pred_mod.update_immediate_velocity) == "function", "update_immediate_velocity must be a function")
+assert(type(pred_mod.is_prediction_starved) == "function", "is_prediction_starved must be a function")
+assert(pred_mod.is_prediction_starved(10.0, 10.3, 0.200) == true, "prediction should starve after timeout")
+assert(pred_mod.is_prediction_starved(10.0, 10.1, 0.200) == false, "prediction should not starve within timeout")
+
+-- 6.6 Netcode reconciler submodule test
+local recon_mod = require("loci.netcode.reconciler")
+local reconcile_ent = { x = 10, y = 10, _error_x = 0, _error_y = 0 }
+recon_mod.reconcile_position(reconcile_ent, 15, 10, 50.0, 2.0)
+assert(reconcile_ent._error_x == 5, "reconciler should record moderate delta for smoothing")
+recon_mod.decay_error(reconcile_ent, 0.1, 15.0)
+assert(reconcile_ent.x > 10, "entity x should advance during error decay")
+
+-- 6.7 Network schema & transport & protocol submodules test
+local schema_submod = require("loci.network.schema")
+assert(type(schema_submod.load) == "function", "schema.load must be a function")
+
+local proto_submod = require("loci.network.protocol")
+assert(type(proto_submod.handle_response) == "function", "protocol.handle_response must be a function")
+
+local transport_submod = require("loci.network.transport")
+assert(type(transport_submod.create_udp) == "function", "transport.create_udp must be a function")
+
+-- 6.8 Telemetry submodules test
+local stats_submod = require("loci.telemetry.stats")
+assert(type(stats_submod.new) == "function", "stats.new must be a function")
+
+local overlay_submod = require("loci.telemetry.overlay")
+assert(type(overlay_submod.draw_overlay) == "function", "overlay.draw_overlay must be a function")
+
+local exporter_submod = require("loci.telemetry.exporter")
+assert(type(exporter_submod.export_csv) == "function", "exporter.export_csv must be a function")
+
+-- ============================================================================
+-- 7. Test Uplink MoveIntent Resilience, Horizon Calibration & Symmetric Sim (Issue #6 / ADR 0003)
+-- ============================================================================
+assert(loci.netcode.prediction_timeout == 0.500, "prediction_timeout must default to 0.500s")
+assert(loci.netcode.intent_keepalive_interval == 0.100, "intent_keepalive_interval must default to 0.100s")
+assert(loci.netcode.stop_redundancy_count == 3, "stop_redundancy_count must default to 3")
+
+local s7_intents = {}
+local orig_s7_send = loci._send_intent
+loci._send_intent = function(intent)
+    table.insert(s7_intents, intent)
+end
+loci._udp = {
+    receive = function() return nil, "timeout" end,
+    send = function() end,
+    close = function() end
+}
+
+-- Setup local entity (id = 700)
+loci.my_entity_id = 700
+loci.entities = {
+    [700] = entity_mod.new_entity(700, "Player_S7")
+}
+local s7_ent = loci.entities[700]
+s7_ent.x = 0
+s7_ent.y = 0
+s7_ent.server_x = 0
+s7_ent.server_y = 0
+loci._player_name = "Player_S7"
+loci._last_state_tick = 100
+loci._mock_time = 1000.000
+loci._last_packet_received_time = 1000.000
+loci._last_state_received_time = 1000.000
+loci._last_heartbeat_time = 1000.000
+loci._active_move_dx = 0
+loci._active_move_dy = 0
+loci._stop_redundancy_remaining = 0
+loci._was_incapacitated_with_move = false
+loci._active_move_cleared_by_timeout = false
+
+-- 7.1 Active MoveIntent Keepalive (100ms) recovers from dropped initial UDP move packet
+loci.send_move(1, 0)
+assert(#s7_intents == 1 and s7_intents[1].move ~= nil, "initial send_move must emit move intent")
+
+-- Before 100ms keepalive (at +50ms): no duplicate move resend
+loci._mock_time = 1000.050
+loci.update(0.016)
+assert(#s7_intents == 1, "keepalive must not resend before 100ms interval")
+
+-- At +110ms: keepalive resends active move intent
+loci._mock_time = 1000.110
+loci.update(0.016)
+assert(#s7_intents == 2 and s7_intents[2].move ~= nil, "keepalive must resend active move after 100ms")
+
+-- 7.2 CC-aware keepalive pause & immediate recovery flush upon stun/death clearing
+s7_ent.properties["stunned_until"] = "150" -- active CC (> tick 100)
+loci._mock_time = 1000.300
+loci._last_packet_received_time = 1000.300
+loci._last_heartbeat_time = 1000.300
+loci.update(0.016)
+assert(#s7_intents == 2, "keepalive must pause during CC to prevent rejection spam")
+assert(loci._was_incapacitated_with_move == true, "must remember move intent was suppressed during CC")
+
+-- CC expires on tick 155 -> immediate automatic move resend on next update!
+loci._last_state_tick = 155
+s7_ent.properties["stunned_until"] = "0"
+loci._mock_time = 1000.320
+loci.update(0.016)
+assert(#s7_intents == 3 and s7_intents[3].move ~= nil, "must immediately flush active move intent once CC ends")
+assert(loci._was_incapacitated_with_move == false, "_was_incapacitated_with_move must reset after flush")
+
+-- 7.3 Stop redundancy burst emits extra (0, 0) packets and stops cleanly
+s7_intents = {}
+loci._mock_time = 1001.000
+loci._last_packet_received_time = 1001.000
+loci._last_heartbeat_time = 1001.000
+loci.send_move(0, 0)
+assert(#s7_intents == 1, "transition to stop emits first (0,0) packet")
+assert(s7_intents[1].move.direction.x_bits == 0 and s7_intents[1].move.direction.y_bits == 0, "stop direction must be (0,0)")
+
+loci._mock_time = 1001.035
+loci.update(0.016)
+assert(#s7_intents == 2, "stop redundancy emits 2nd packet after ~35ms")
+
+loci._mock_time = 1001.070
+loci.update(0.016)
+assert(#s7_intents == 3, "stop redundancy emits 3rd packet (total 3 = stop_redundancy_count)")
+
+loci._mock_time = 1001.110
+loci.update(0.016)
+assert(#s7_intents == 3, "must NOT emit idle stop packets beyond stop_redundancy_count")
+
+-- 7.4 500ms default prediction horizon absorbs 400ms Wi-Fi contention micro-stall
+s7_ent.x = 100.0
+s7_ent.y = 0.0
+loci.send_move(1, 0)
+loci._last_state_received_time = 1002.000
+loci._last_packet_received_time = 1002.000
+loci._last_heartbeat_time = 1002.000
+loci._mock_time = 1002.400 -- 400ms silence (< 500ms default horizon)
+loci.update(0.016)
+assert(s7_ent.vx > 0, "400ms micro-stall must NOT freeze prediction under 500ms default horizon")
+loci._mock_time = 1002.600 -- 600ms silence (> 500ms horizon)
+loci.update(0.016)
+assert(s7_ent.vx == 0 and s7_ent.vy == 0, "prediction must still stop beyond 500ms horizon")
+
+-- 7.5 Post-reconnect: entity populated inside on_reconnected & server_vx mirrored until resync
+loci._mock_time = 1008.000 -- > 4.0s timeout triggers disconnect
+loci.update(0.016)
+assert(loci.my_entity_id == nil, "watchdog clears my_entity_id on timeout")
+assert(loci._active_move_cleared_by_timeout == true, "_active_move_cleared_by_timeout must be true")
+
+local entity_available_in_callback = false
+local orig_reconnected_cb = loci.on_reconnected
+loci.on_reconnected = function(id)
+    local me = loci.get_my_entity()
+    entity_available_in_callback = (me ~= nil and me.id == id and me.x == 250)
+end
+loci._handle_world_state({
+    tick = 200,
+    _receive_time = 1008.200,
+    entities = {
+        {
+            id = 700,
+            name = "Player_S7",
+            position = { x_bits = 250 * 65536, y_bits = 0 },
+            velocity = { x_bits = 3 * 65536, y_bits = 0 },
+            properties = {}
+        }
+    }
+})
+assert(entity_available_in_callback == true, "get_my_entity() must return populated entity inside on_reconnected")
+assert(math.abs(s7_ent.vx - 3.0) < 0.001, "timeout-cleared velocity must mirror server_vx (3.0) until send_move resyncs")
+loci._mock_time = 1008.216
+loci.update(0.016)
+assert(math.abs(s7_ent.vx - 3.0) < 0.001, "update() must preserve mirrored server_vx while _active_move_cleared_by_timeout is active")
+
+-- Once consumer calls send_move(0, 0), timeout flag clears and vx zeroes cleanly
+loci.send_move(0, 0)
+assert(loci._active_move_cleared_by_timeout == false, "send_move clears timeout-cleared flag")
+assert(s7_ent.vx == 0, "explicit send_move(0, 0) sets vx = 0")
+
+-- 7.6 Symmetric outbound simulator in protocol + transport
+local udp_sent_packets = {}
+loci._send_intent = orig_s7_send
+loci._udp = {
+    send = function(self, data) table.insert(udp_sent_packets, data) end,
+    receive = function() return nil, "timeout" end,
+    close = function() end
+}
+loci._delayed_outbound_queue = {}
+loci.netcode.simulate_latency = 0.060
+loci.netcode.simulate_packet_loss = 0.0
+loci._mock_time = 1010.000
+loci._last_packet_received_time = 1010.000
+loci._last_state_received_time = 1010.000
+loci._last_heartbeat_time = 1010.000
+
+proto_submod.deliver_encoded_packet(loci, "outbound_move_bytes", 1010.000)
+assert(#udp_sent_packets == 0, "outbound packet must wait in queue during simulate_latency")
+assert(#loci._delayed_outbound_queue == 1, "_delayed_outbound_queue must hold delayed outbound packet")
+
+loci._mock_time = 1010.040
+loci.update(0.016)
+assert(#udp_sent_packets == 0, "outbound packet must not send before latency expires")
+
+loci._mock_time = 1010.070
+loci.update(0.016)
+assert(#udp_sent_packets == 1 and udp_sent_packets[1] == "outbound_move_bytes", "outbound packet must flush via transport after simulate_latency")
+assert(#loci._delayed_outbound_queue == 0, "_delayed_outbound_queue must be empty after flush")
+
+-- Outbound packet loss 100% drops packet cleanly
+loci.netcode.simulate_latency = 0.0
+loci.netcode.simulate_packet_loss = 1.0
+proto_submod.deliver_encoded_packet(loci, "dropped_outbound_bytes", 1010.100)
+assert(#udp_sent_packets == 1, "100% simulate_packet_loss must drop outbound packets symmetrically")
+
+-- Cleanup Section 7 state
+loci.netcode.simulate_packet_loss = 0.0
+loci.netcode.simulate_latency = 0.0
+loci._delayed_outbound_queue = {}
+loci._delayed_packet_queue = {}
+loci.on_reconnected = orig_reconnected_cb
 loci._udp = nil
 loci._mock_time = nil
 

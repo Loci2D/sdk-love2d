@@ -40,8 +40,8 @@ jobs:
             TAG="${{ github.event.inputs.tag }}"
             VERSION="${TAG#v}"
           else
-            # Extract from loci_client.lua VERSION = "..."
-            VERSION=$(grep -oE 'VERSION = "[^"]+"' loci_client.lua | cut -d'"' -f2)
+            # Extract from loci/init.lua (or loci_client.lua fallback) VERSION = "..."
+            VERSION=$(grep -oE 'VERSION = "[^"]+"' loci/init.lua loci_client.lua 2>/dev/null | head -n1 | cut -d'"' -f2)
             TAG="v${VERSION}"
           fi
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
@@ -173,10 +173,13 @@ jobs:
 
           # 1. Populate loci2d SDK drop-in folder
           cp loci_client.lua package-bundle/loci2d/
+          cp loci.lua package-bundle/loci2d/
+          cp -r loci package-bundle/loci2d/
           cp README.md LICENSE AI_REFERENCE.md package-bundle/loci2d/
           cp lib/game_packets.proto package-bundle/loci2d/lib/
           cp lib/game_packets.pb package-bundle/loci2d/lib/
           cp lib/protoc.lua package-bundle/loci2d/lib/
+          cp lib/network_stats.lua package-bundle/loci2d/lib/
 
           # 2. Add native pre-compiled binaries
           cp downloaded-binaries/linux/pb.so package-bundle/loci2d/lib/

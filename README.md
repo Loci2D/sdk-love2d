@@ -10,13 +10,21 @@ The **Loci2D Love2D SDK** (`loci_client.lua`) is a high-level abstraction layer 
 
 ```text
 sdk-love2d/
-├── loci_client.lua        # Main client module (API Facade, State Manager, and Netcode)
+├── loci.lua               # Primary module entry point (`require("loci")`)
+├── loci_client.lua        # Backward-compatibility shim (`require("loci_client")`)
+├── loci/                  # Modular SDK implementation
+│   ├── init.lua           # Public API Facade & lifecycle manager
+│   ├── entity.lua         # Entity metatable, properties auto-casting, queries
+│   ├── network/           # Transport UDP, Protobuf schema, and protocol dispatch
+│   ├── netcode/           # Snapshot buffer, interpolation, prediction & reconciliation
+│   └── telemetry/         # Zero-GC RFC 3550 jitter, RTT, HUD overlay & CSV exporter
 ├── test_sdk.lua           # Unit test suite to validate the SDK locally
 ├── AI_REFERENCE.md        # Compact API reference formatted for LLMs / AI Agents
 ├── lib/
 │   ├── game_packets.proto # Loci2D Protobuf packet definitions
 │   ├── game_packets.pb    # Pre-compiled binary descriptor (ultra-fast loading)
-│   └── protoc.lua         # Pure-Lua Protobuf parser (fallback for runtime dynamic parsing)
+│   ├── protoc.lua         # Pure-Lua Protobuf parser (fallback for runtime dynamic parsing)
+│   └── network_stats.lua  # Backward-compatibility shim for telemetry
 └── docs/
     ├── index.html         # Interactive visual guide for Love2D game development
     └── server_scripts.html# Guide for authoring server-side game rules
@@ -97,11 +105,52 @@ function love.draw()
         end
         love.graphics.circle("fill", entity.x, entity.y, 16)
     end
+    -- Draw network telemetry overlay if active (F3)
+    loci.draw()
+end
+
+function love.keypressed(key)
+    loci.keypressed(key) -- F3: Toggle HUD | F4: Export CSV
 end
 
 function love.quit()
+    loci.quit()
     loci.disconnect("Game closed")
 end
 ```
+
+---
+
+## Network Telemetry & Localhost Validation (`tc`/`netem`)
+
+The SDK provides high-precision, **Zero-GC** network telemetry to measure RTT, RFC 3550 Jitter, Packet Loss %, and Snapshot Arrival Frequency (Hz).
+
+* **F3**: Toggle on-screen debug HUD (`[REDE] Ping: 42ms (min: 35 | max: 85) | Jitter: 8.2ms | Loss: 1.2% | Tick: 30.1 Hz`).
+* **F4**: Export raw CSV log to `logs/network_stats_<timestamp>.csv`.
+* **Export on Exit**: Automatically flushed via `loci.quit()`.
+
+### Localhost Simulation (Linux `tc`/`netem`)
+
+To validate telemetry metrics against synthetic perturbations on `127.0.0.1`:
+
+* **Stable Wi-Fi (40ms latency, ±5ms jitter, 0.5% loss):**
+  ```bash
+  sudo tc qdisc add dev lo root netem delay 40ms 5ms loss 0.5%
+  ```
+
+* **Congested Wi-Fi (80ms latency, ±25ms jitter, 5% loss):**
+  ```bash
+  sudo tc qdisc add dev lo root netem delay 80ms 25ms loss 5%
+  ```
+
+* **Bursts & Packet Reordering (60ms latency, 25% reordered):**
+  ```bash
+  sudo tc qdisc add dev lo root netem delay 60ms 10ms reorder 25% 50%
+  ```
+
+* **Restore Normal Localhost (remove rules):**
+  ```bash
+  sudo tc qdisc del dev lo root
+  ```
 
 For the complete interactive guide, open `docs/index.html` in your browser.
