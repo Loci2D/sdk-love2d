@@ -1328,4 +1328,143 @@ loci.obstacles = {}
 loci._obstacles_list_cache = nil
 loci._mock_time = nil
 
+-- ============================================================================
+-- Section 9: Session Resume (session_token Handshake, Watchdog & Socket Resume)
+-- ============================================================================
+
+local s9_intents = {}
+local orig_s9_send = loci._send_intent
+loci._send_intent = function(intent_table)
+    table.insert(s9_intents, intent_table)
+end
+
+loci.entities = {}
+loci._entities_list_cache = nil
+loci.my_entity_id = nil
+loci._player_name = "ResumeHero"
+loci.set_session_token(nil)
+assert(loci.get_session_token() == nil, "session_token must start nil")
+
+-- 9.1 Initial JoinIntent has no session_token; ServerResponse stores token
+loci._send_join_intent()
+assert(#s9_intents == 1 and s9_intents[1].join ~= nil, "initial join intent must be emitted")
+assert(s9_intents[1].join.session_token == nil, "initial join must omit session_token when nil")
+
+loci._handle_response({
+    sequence_id = 1,
+    status = "joined",
+    session_token = "tok_resume_999"
+})
+assert(loci.get_session_token() == "tok_resume_999", "ServerResponse must persist session_token in SDK")
+
+loci._handle_world_state({
+    tick = 500,
+    _receive_time = 3000.0,
+    entities = {
+        {
+            id = 801,
+            name = "ResumeHero",
+            position = { x_bits = 12 * 65536, y_bits = -4 * 65536 },
+            velocity = { x_bits = 0, y_bits = 0 },
+            properties = { { key = "team", value = "Red" }, { key = "score", value = "25" } }
+        }
+    }
+})
+assert(loci.my_entity_id == 801, "my_entity_id must bind to 801")
+
+-- 9.2 Watchdog timeout & join retry automatically attach session_token
+s9_intents = {}
+loci._udp = {
+    send = function() end,
+    receive = function() return nil, "timeout" end,
+    close = function() end
+}
+loci.netcode.auto_reconnect = true
+loci.netcode.connection_timeout = 4.0
+loci._last_packet_received_time = 3000.0
+loci._mock_time = 3005.0 -- > 4.0s triggers watchdog
+
+local s9_lost_called = false
+local orig_s9_lost = loci.on_connection_lost
+loci.on_connection_lost = function(reason) s9_lost_called = true end
+
+loci.update(0.016)
+assert(s9_lost_called == true, "on_connection_lost must fire on timeout")
+assert(loci.my_entity_id == nil, "my_entity_id cleared during reconnect")
+assert(loci.get_session_token() == "tok_resume_999", "session_token must be preserved across timeout")
+assert(#s9_intents == 1 and s9_intents[1].join ~= nil, "watchdog must emit reconnect JoinIntent")
+assert(s9_intents[1].join.session_token == "tok_resume_999", "watchdog JoinIntent must include stored session_token")
+
+-- Retry cadence (1.0s while reconnecting) also sends session_token
+loci._mock_time = 3006.1
+loci.update(0.016)
+assert(#s9_intents == 2 and s9_intents[2].join.session_token == "tok_resume_999", "retry JoinIntent must include stored session_token")
+
+-- Server responds with status="resumed" and next WorldState fires on_reconnected
+local s9_reconnected_id = nil
+loci.on_reconnected = function(id) s9_reconnected_id = id end
+loci._handle_response({
+    sequence_id = 2,
+    status = "resumed",
+    session_token = "tok_resume_999"
+})
+loci._handle_world_state({
+    tick = 510,
+    _receive_time = 3006.2,
+    entities = {
+        {
+            id = 801,
+            name = "ResumeHero",
+            position = { x_bits = 12 * 65536, y_bits = -4 * 65536 },
+            velocity = { x_bits = 0, y_bits = 0 },
+            properties = { { key = "team", value = "Red" }, { key = "score", value = "25" } }
+        }
+    }
+})
+assert(s9_reconnected_id == 801, "on_reconnected must fire with original entity_id 801")
+assert(loci.get_my_entity().team == "Red" and loci.get_my_entity().score == 25, "resumed entity properties must be preserved")
+
+-- 9.3 Explicit disconnect clears session_token
+loci.disconnect("quit match")
+assert(loci.get_session_token() == nil, "explicit disconnect must clear session_token")
+
+-- 9.4 Protobuf binary roundtrip for JoinIntent.session_token and ServerResponse.session_token
+if ok_pb and pb then
+    local loaded = schema_submod.load("lib/")
+    assert(loaded, "schema.load('lib/') must succeed")
+    loci._schema_loaded = true
+    loci.set_session_token(nil)
+
+    local encoded_join = proto_submod.encode_game_packet(pb, 77, 3010.0, {
+        join = {
+            player_name = "ResumeHero",
+            schema_version = 1,
+            session_token = "pb_tok_12345"
+        }
+    })
+    assert(encoded_join ~= nil and #encoded_join > 0, "GamePacket JoinIntent with session_token must encode")
+    local decoded_join = pb.decode("loci2d.GamePacket", encoded_join)
+    assert(decoded_join.intent.join.session_token == "pb_tok_12345", "JoinIntent.session_token protobuf roundtrip mismatch")
+
+    local encoded_resp = pb.encode("loci2d.ServerPacket", {
+        sequence_id = 77,
+        response = {
+            sequence_id = 77,
+            status = "joined",
+            session_token = "pb_tok_12345"
+        }
+    })
+    loci._mock_time = 3010.05
+    loci._dispatch_raw_packet(encoded_resp)
+    assert(loci.get_session_token() == "pb_tok_12345", "_dispatch_raw_packet must capture ServerResponse.session_token")
+end
+
+-- Cleanup Section 9
+loci._send_intent = orig_s9_send
+loci.on_connection_lost = orig_s9_lost
+loci.on_reconnected = orig_reconnected_cb
+loci.set_session_token(nil)
+loci._udp = nil
+loci._mock_time = nil
+
 print("All loci_client.lua SDK unit tests passed successfully!")

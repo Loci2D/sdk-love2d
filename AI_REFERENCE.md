@@ -10,10 +10,12 @@
 
 ## Public SDK API
 
-### 1. Connection Lifecycle
-- `loci.connect(ip, port, player_name)`: Connects to the server.
-- `loci.disconnect(reason)`: Disconnects gracefully.
-- `loci.update(dt)`: **MUST** be called every frame inside `love.update(dt)`. It processes all network packets and handles entity interpolation.
+### 1. Connection Lifecycle & Session Resume
+- `loci.connect(ip, port, player_name, [base_path], [tick_rate], [session_token])`: Connects to the server (and optionally resumes an existing session if `session_token` is provided).
+- `loci.resume(ip, port, [player_name], [session_token])`: Reconnects over a new UDP socket using the stored (or provided) `session_token` so the player reclaims their existing entity, team, and score without spawning a clone.
+- `loci.get_session_token()` / `loci.set_session_token(token)`: Gets or sets the active session resume token.
+- `loci.disconnect(reason)`: Disconnects gracefully and invalidates the current `session_token`.
+- `loci.update(dt)`: **MUST** be called every frame inside `love.update(dt)`. It processes all network packets, handles entity interpolation, and runs the automatic reconnection watchdog.
 
 ### 2. State Access
 - `loci.get_entities()`: Returns a table of all entities currently visible to the client.
@@ -63,6 +65,8 @@ The developer must assign functions to these callbacks to react to server events
 - `loci.on_action_cast = function(entity, ability_id, dir_x, dir_y)`: Fired when an entity successfully casts an ability. Trigger particle effects or sounds here.
 - `loci.on_match_state_changed = function(state, winner)`: `state` is "running", "paused", or "ended".
 - `loci.on_intent_rejected = function(reason)`: Fired if the server denies a client action.
+- `loci.on_connection_lost = function(reason)`: Fired when heartbeat timeout detects connection loss.
+- `loci.on_reconnected = function(entity_id)`: Fired when the player's session is resumed after a drop or socket change.
 
 ## AI Instructions
 When asked to implement a game feature:

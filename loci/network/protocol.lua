@@ -103,7 +103,21 @@ function protocol_module.dispatch_raw_packet(ctx, schema, data)
 end
 
 function protocol_module.handle_response(ctx, resp)
-    if resp and resp.status then
+    if not resp then return end
+
+    if resp.session_token and resp.session_token ~= "" then
+        ctx._session_token = resp.session_token
+    end
+
+    if resp.status == "resumed" then
+        if ctx.my_entity_id == nil then
+            ctx._is_reconnecting = true
+        elseif ctx.on_reconnected then
+            pcall(ctx.on_reconnected, ctx.my_entity_id)
+        end
+    end
+
+    if resp.status then
         local prefix = "rejected: "
         if string.sub(resp.status, 1, string.len(prefix)) == prefix then
             local reason = string.sub(resp.status, string.len(prefix) + 1)
