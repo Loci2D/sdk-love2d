@@ -10,6 +10,7 @@ local modname = ... or "loci"
 local prefix = (modname:match("^(.-)init$") or (modname .. ".")):gsub("%.+$", ".")
 
 local entity_mod = require(prefix .. "entity")
+local obstacle_mod = require(prefix .. "obstacle")
 local schema_mod = require(prefix .. "network.schema")
 local protocol_mod = require(prefix .. "network.protocol")
 local transport_mod = require(prefix .. "network.transport")
@@ -23,10 +24,11 @@ local exporter_mod = require(prefix .. "telemetry.exporter")
 
 local loci = {
     -- Metadata
-    VERSION = "0.6.3",
+    VERSION = "0.6.4",
     COMPATIBLE_ENGINE_VERSION = "0.6.x",
     SCHEMA_VERSION = 1,
     entities = {},
+    obstacles = {},
     globals = {},
     my_entity_id = nil,
     match_state = "running",
@@ -36,6 +38,8 @@ local loci = {
     -- Netcode & Latency Compensation Configuration (ADR 0001, ADR 0002 & ADR 0003)
     netcode = {
         prediction_enabled = true,
+        obstacle_collision_prediction = true, -- Resolve predicted movement against solid obstacles
+        default_entity_radius = 2.0,      -- Matches server default entity collider radius
         interpolation_delay = 0.050,      -- 50ms buffer (safe for 30Hz LAN Wi-Fi)
         reconciliation_threshold = 2.0,    -- 2px tolerance
         snap_threshold = 50.0,             -- 50px max error before hard snap
@@ -64,6 +68,9 @@ local loci = {
     on_entity_spawned = function(entity) end,
     on_entity_despawned = function(entity_id) end,
     on_property_changed = function(entity, key, old_val, new_val) end,
+    on_obstacle_spawned = function(obstacle) end,
+    on_obstacle_destroyed = function(obstacle_id, obstacle) end,
+    on_obstacle_property_changed = function(obstacle, key, old_val, new_val) end,
     on_match_state_changed = function(state, winner) end,
     on_action_cast = function(entity, ability_id, dir_x, dir_y) end,
     on_intent_rejected = function(reason) end,
@@ -89,8 +96,11 @@ local loci = {
     _delayed_packet_queue = {},
     _delayed_outbound_queue = {},
     _player_name = nil,
+    _session_token = nil,
     _base_path = "lib/",
     _entities_list_cache = nil,
+    _obstacles_list_cache = nil,
+    _public_obstacles_list = nil,
     _snapshot_buffer = {},
     _max_snapshot_history = 20,
     _prediction_handler = nil,
@@ -99,8 +109,30 @@ local loci = {
     _inflight_intents = {},
 }
 
--- Bind context so Entity metatable can inspect loci state
+-- Bind context so Entity and Obstacle metatables can inspect loci state
 entity_mod.bind_context(loci)
+obstacle_mod.bind_context(loci)
+
+local function reset_session_state()
+    loci.obstacles = {}
+    loci._obstacles_list_cache = nil
+    loci._snapshot_buffer = {}
+    loci._active_move_dx = 0
+    loci._active_move_dy = 0
+    loci._last_move_sent_time = nil
+    loci._last_stop_send_time = 0
+    loci._stop_redundancy_remaining = 0
+    loci._was_incapacitated_with_move = false
+    loci._active_move_cleared_by_timeout = false
+    loci._last_state_received_time = nil
+    loci._last_packet_received_time = nil
+    loci._is_reconnecting = false
+    loci._delayed_packet_queue = {}
+    loci._delayed_outbound_queue = {}
+    loci._last_heartbeat_time = 0
+    loci._last_join_attempt_time = 0
+    loci._inflight_intents = {}
+end
 
 function loci.get_server_tick_rate()
     return loci.server_tick_rate or 30.0
@@ -121,23 +153,42 @@ function loci.get_snapshot_buffer()
     return loci._snapshot_buffer
 end
 
-function loci.connect(host, port, player_name, base_path, tick_rate)
-    loci._snapshot_buffer = {}
-    loci._active_move_dx = 0
-    loci._active_move_dy = 0
-    loci._last_move_sent_time = nil
-    loci._last_stop_send_time = 0
-    loci._stop_redundancy_remaining = 0
-    loci._was_incapacitated_with_move = false
-    loci._active_move_cleared_by_timeout = false
-    loci._last_state_received_time = nil
-    loci._last_packet_received_time = nil
-    loci._is_reconnecting = false
-    loci._delayed_packet_queue = {}
-    loci._delayed_outbound_queue = {}
-    loci._last_heartbeat_time = 0
-    loci._last_join_attempt_time = 0
-    loci._inflight_intents = {}
+function loci.get_session_token()
+    return loci._session_token
+end
+
+function loci.set_session_token(token)
+    if token and token ~= "" then
+        loci._session_token = token
+    else
+        loci._session_token = nil
+    end
+end
+
+function loci._send_join_intent()
+    local join_payload = {
+        player_name = loci._player_name,
+        schema_version = loci.SCHEMA_VERSION,
+    }
+    if loci._session_token and loci._session_token ~= "" then
+        join_payload.session_token = loci._session_token
+    end
+    loci._send_intent({ join = join_payload })
+end
+
+function loci.connect(host, port, player_name, base_path, tick_rate, session_token)
+    reset_session_state()
+    loci.my_entity_id = nil
+    loci.entities = {}
+    loci._entities_list_cache = nil
+
+    if session_token and session_token ~= "" then
+        loci._session_token = session_token
+        loci._is_reconnecting = true
+    else
+        loci._session_token = nil
+    end
+
     if base_path then
         loci._base_path = base_path
     end
@@ -145,6 +196,9 @@ function loci.connect(host, port, player_name, base_path, tick_rate)
         loci.server_tick_rate = tonumber(tick_rate)
     end
 
+    if loci._udp then
+        transport_mod.close_udp(loci._udp)
+    end
     loci._udp = transport_mod.create_udp(host, port)
     loci._player_name = player_name
 
@@ -152,7 +206,7 @@ function loci.connect(host, port, player_name, base_path, tick_rate)
     loci._schema_loaded = schema_loaded
 
     if schema_loaded then
-        loci._send_intent({ join = { player_name = player_name, schema_version = loci.SCHEMA_VERSION } })
+        loci._send_join_intent()
         return true
     else
         print("[Error] Could not load game_packets schema definition. Aborting network.")
@@ -164,26 +218,19 @@ function loci.connect(host, port, player_name, base_path, tick_rate)
     end
 end
 
+function loci.resume(host, port, player_name, session_token, base_path, tick_rate)
+    local token = (session_token and session_token ~= "") and session_token or loci._session_token
+    return loci.connect(host, port, player_name or loci._player_name, base_path, tick_rate, token)
+end
+
 function loci.disconnect(reason)
-    loci._snapshot_buffer = {}
-    loci._active_move_dx = 0
-    loci._active_move_dy = 0
-    loci._last_move_sent_time = nil
-    loci._last_stop_send_time = 0
-    loci._stop_redundancy_remaining = 0
-    loci._was_incapacitated_with_move = false
-    loci._active_move_cleared_by_timeout = false
-    loci._last_state_received_time = nil
-    loci._last_packet_received_time = nil
-    loci._is_reconnecting = false
-    loci._delayed_packet_queue = {}
-    loci._delayed_outbound_queue = {}
-    loci._inflight_intents = {}
+    reset_session_state()
     if loci._udp then
         loci._send_intent({ disconnect = { reason = reason or "client closing" } })
         transport_mod.close_udp(loci._udp)
         loci._udp = nil
     end
+    loci._session_token = nil
 end
 
 function loci._send_intent(intent_table)
@@ -278,6 +325,26 @@ end
 
 function loci.get_globals()
     return entity_mod.get_globals(loci)
+end
+
+function loci.get_obstacles()
+    return obstacle_mod.get_obstacles(loci)
+end
+
+function loci.get_obstacle(id)
+    return obstacle_mod.get_obstacle(loci, id)
+end
+
+function loci.get_obstacles_by_blueprint(blueprint_name)
+    return obstacle_mod.get_obstacles_by_blueprint(loci, blueprint_name)
+end
+
+function loci.get_solid_obstacles()
+    return obstacle_mod.get_solid_obstacles(loci)
+end
+
+function loci.get_obstacles_in_radius(center_x, center_y, radius)
+    return obstacle_mod.get_obstacles_in_radius(loci, center_x, center_y, radius)
 end
 
 function loci._interpolate_remote_entity(entity, render_time, tick_rate)
@@ -443,33 +510,7 @@ function loci._handle_world_state(state)
             end
 
             -- Diff properties with auto-casting
-            local new_props = {}
-            if raw_ent.properties then
-                for _, prop in ipairs(raw_ent.properties) do
-                    new_props[prop.key] = true
-                    local casted_val = entity_mod.cast_property_value(prop.value)
-                    local old_val = ent.properties[prop.key]
-                    if old_val ~= casted_val then
-                        ent.properties[prop.key] = casted_val
-                        if not is_new and loci.on_property_changed then
-                            loci.on_property_changed(ent, prop.key, old_val, casted_val)
-                        end
-                    end
-                end
-            end
-            -- Check for removed properties
-            local to_remove = {}
-            for k, old_val in pairs(ent.properties) do
-                if not new_props[k] then
-                    table.insert(to_remove, k)
-                    if not is_new and loci.on_property_changed then
-                        loci.on_property_changed(ent, k, old_val, nil)
-                    end
-                end
-            end
-            for _, k in ipairs(to_remove) do
-                ent.properties[k] = nil
-            end
+            entity_mod.sync_properties(ent, raw_ent.properties, is_new, loci.on_property_changed)
 
             if is_new then
                 loci.entities[entity_id] = ent
@@ -498,6 +539,44 @@ function loci._handle_world_state(state)
             if loci.my_entity_id == id then
                 loci.my_entity_id = nil
             end
+        end
+    end
+
+    -- Ingest and diff static obstacles
+    local new_obstacles = {}
+    if state.obstacles then
+        for _, raw_obs in ipairs(state.obstacles) do
+            local obs_id = raw_obs.id
+            local obs = loci.obstacles[obs_id]
+            local is_new = false
+            if not obs then
+                is_new = true
+                obs = obstacle_mod.new_obstacle(obs_id, raw_obs.blueprint)
+            end
+
+            obstacle_mod.apply_snapshot(obs, raw_obs)
+            entity_mod.sync_properties(obs, raw_obs.properties, is_new, loci.on_obstacle_property_changed)
+
+            if is_new then
+                loci.obstacles[obs_id] = obs
+                loci._obstacles_list_cache = nil
+                if loci.on_obstacle_spawned then
+                    loci.on_obstacle_spawned(obs)
+                end
+            end
+
+            new_obstacles[obs_id] = true
+        end
+    end
+
+    -- Destroy obstacles not in the new state
+    for id, obs in pairs(loci.obstacles) do
+        if not new_obstacles[id] then
+            if loci.on_obstacle_destroyed then
+                loci.on_obstacle_destroyed(id, obs)
+            end
+            loci.obstacles[id] = nil
+            loci._obstacles_list_cache = nil
         end
     end
 

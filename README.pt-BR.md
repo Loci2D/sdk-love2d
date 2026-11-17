@@ -15,6 +15,7 @@ sdk-love2d/
 ├── loci/                  # Implementação modular do SDK
 │   ├── init.lua           # Fachada pública da API e orquestrador
 │   ├── entity.lua         # Metatabela Entity, auto-casting de propriedades e queries
+│   ├── obstacle.lua       # Metatabela Obstacle, helpers de bounds e queries espaciais
 │   ├── network/           # Transporte UDP, schema Protobuf e despacho de protocolos
 │   ├── netcode/           # Buffer de snapshots, interpolação, predição e reconciliação
 │   └── telemetry/         # Telemetria Zero-GC RFC 3550, RTT, overlay HUD e exportador CSV

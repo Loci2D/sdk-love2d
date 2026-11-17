@@ -21,6 +21,23 @@ function transport_module.close_udp(udp)
     end
 end
 
+local function send_join(ctx)
+    if ctx._send_join_intent then
+        ctx._send_join_intent()
+        return
+    end
+    if ctx._send_intent then
+        local join_payload = {
+            player_name = ctx._player_name,
+            schema_version = ctx.SCHEMA_VERSION,
+        }
+        if ctx._session_token and ctx._session_token ~= "" then
+            join_payload.session_token = ctx._session_token
+        end
+        ctx._send_intent({ join = join_payload })
+    end
+end
+
 function transport_module.poll_network(ctx, now, on_dispatch_packet, is_incapacitated)
     if not ctx._udp then return end
 
@@ -40,8 +57,8 @@ function transport_module.poll_network(ctx, now, on_dispatch_packet, is_incapaci
             if ctx.on_connection_lost then
                 pcall(ctx.on_connection_lost, "heartbeat timeout")
             end
-            if ctx.netcode and ctx.netcode.auto_reconnect and ctx._player_name and ctx._send_intent then
-                ctx._send_intent({ join = { player_name = ctx._player_name, schema_version = ctx.SCHEMA_VERSION } })
+            if ctx.netcode and ctx.netcode.auto_reconnect and ctx._player_name then
+                send_join(ctx)
             end
         end
     end
@@ -52,9 +69,7 @@ function transport_module.poll_network(ctx, now, on_dispatch_packet, is_incapaci
         local retry_interval = ctx._is_reconnecting and 1.0 or 2.0
         if (now - (ctx._last_join_attempt_time or 0)) >= retry_interval then
             ctx._last_join_attempt_time = now
-            if ctx._send_intent then
-                ctx._send_intent({ join = { player_name = ctx._player_name, schema_version = ctx.SCHEMA_VERSION } })
-            end
+            send_join(ctx)
         end
     else
         -- Accelerated heartbeat ping once connected (ADR 0002)
