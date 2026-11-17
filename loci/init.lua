@@ -89,6 +89,7 @@ local loci = {
     _delayed_packet_queue = {},
     _delayed_outbound_queue = {},
     _player_name = nil,
+    _session_token = nil,
     _base_path = "lib/",
     _entities_list_cache = nil,
     _snapshot_buffer = {},
@@ -101,6 +102,25 @@ local loci = {
 
 -- Bind context so Entity metatable can inspect loci state
 entity_mod.bind_context(loci)
+
+local function reset_session_state()
+    loci._snapshot_buffer = {}
+    loci._active_move_dx = 0
+    loci._active_move_dy = 0
+    loci._last_move_sent_time = nil
+    loci._last_stop_send_time = 0
+    loci._stop_redundancy_remaining = 0
+    loci._was_incapacitated_with_move = false
+    loci._active_move_cleared_by_timeout = false
+    loci._last_state_received_time = nil
+    loci._last_packet_received_time = nil
+    loci._is_reconnecting = false
+    loci._delayed_packet_queue = {}
+    loci._delayed_outbound_queue = {}
+    loci._last_heartbeat_time = 0
+    loci._last_join_attempt_time = 0
+    loci._inflight_intents = {}
+end
 
 function loci.get_server_tick_rate()
     return loci.server_tick_rate or 30.0
@@ -121,23 +141,42 @@ function loci.get_snapshot_buffer()
     return loci._snapshot_buffer
 end
 
-function loci.connect(host, port, player_name, base_path, tick_rate)
-    loci._snapshot_buffer = {}
-    loci._active_move_dx = 0
-    loci._active_move_dy = 0
-    loci._last_move_sent_time = nil
-    loci._last_stop_send_time = 0
-    loci._stop_redundancy_remaining = 0
-    loci._was_incapacitated_with_move = false
-    loci._active_move_cleared_by_timeout = false
-    loci._last_state_received_time = nil
-    loci._last_packet_received_time = nil
-    loci._is_reconnecting = false
-    loci._delayed_packet_queue = {}
-    loci._delayed_outbound_queue = {}
-    loci._last_heartbeat_time = 0
-    loci._last_join_attempt_time = 0
-    loci._inflight_intents = {}
+function loci.get_session_token()
+    return loci._session_token
+end
+
+function loci.set_session_token(token)
+    if token and token ~= "" then
+        loci._session_token = token
+    else
+        loci._session_token = nil
+    end
+end
+
+function loci._send_join_intent()
+    local join_payload = {
+        player_name = loci._player_name,
+        schema_version = loci.SCHEMA_VERSION,
+    }
+    if loci._session_token and loci._session_token ~= "" then
+        join_payload.session_token = loci._session_token
+    end
+    loci._send_intent({ join = join_payload })
+end
+
+function loci.connect(host, port, player_name, base_path, tick_rate, session_token)
+    reset_session_state()
+    loci.my_entity_id = nil
+    loci.entities = {}
+    loci._entities_list_cache = nil
+
+    if session_token and session_token ~= "" then
+        loci._session_token = session_token
+        loci._is_reconnecting = true
+    else
+        loci._session_token = nil
+    end
+
     if base_path then
         loci._base_path = base_path
     end
@@ -145,6 +184,9 @@ function loci.connect(host, port, player_name, base_path, tick_rate)
         loci.server_tick_rate = tonumber(tick_rate)
     end
 
+    if loci._udp then
+        transport_mod.close_udp(loci._udp)
+    end
     loci._udp = transport_mod.create_udp(host, port)
     loci._player_name = player_name
 
@@ -152,7 +194,7 @@ function loci.connect(host, port, player_name, base_path, tick_rate)
     loci._schema_loaded = schema_loaded
 
     if schema_loaded then
-        loci._send_intent({ join = { player_name = player_name, schema_version = loci.SCHEMA_VERSION } })
+        loci._send_join_intent()
         return true
     else
         print("[Error] Could not load game_packets schema definition. Aborting network.")
@@ -164,26 +206,19 @@ function loci.connect(host, port, player_name, base_path, tick_rate)
     end
 end
 
+function loci.resume(host, port, player_name, session_token, base_path, tick_rate)
+    local token = (session_token and session_token ~= "") and session_token or loci._session_token
+    return loci.connect(host, port, player_name or loci._player_name, base_path, tick_rate, token)
+end
+
 function loci.disconnect(reason)
-    loci._snapshot_buffer = {}
-    loci._active_move_dx = 0
-    loci._active_move_dy = 0
-    loci._last_move_sent_time = nil
-    loci._last_stop_send_time = 0
-    loci._stop_redundancy_remaining = 0
-    loci._was_incapacitated_with_move = false
-    loci._active_move_cleared_by_timeout = false
-    loci._last_state_received_time = nil
-    loci._last_packet_received_time = nil
-    loci._is_reconnecting = false
-    loci._delayed_packet_queue = {}
-    loci._delayed_outbound_queue = {}
-    loci._inflight_intents = {}
+    reset_session_state()
     if loci._udp then
         loci._send_intent({ disconnect = { reason = reason or "client closing" } })
         transport_mod.close_udp(loci._udp)
         loci._udp = nil
     end
+    loci._session_token = nil
 end
 
 function loci._send_intent(intent_table)
