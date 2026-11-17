@@ -22,6 +22,11 @@
 - `loci.get_my_entity()`: Returns the local player's `Entity` object.
 - `loci.get_globals()`: Returns a table of global match properties (e.g., scores, timers).
 - `loci.get_entities_in_radius(center_x, center_y, radius)`: Spatial query helper.
+- `loci.get_obstacles()`: Returns a list of all active static obstacles (`wall`, `crate`, `trigger`), sorted by `id`.
+- `loci.get_obstacle(id)`: Returns a single `Obstacle` by ID, or `nil`.
+- `loci.get_obstacles_by_blueprint(blueprint_name)`: Filters active obstacles by blueprint (e.g., `"wall"`, `"crate"`).
+- `loci.get_solid_obstacles()`: Returns only solid physical blockers (`obs.is_solid == true`).
+- `loci.get_obstacles_in_radius(center_x, center_y, radius)`: Spatial query checking shape overlap within `radius`.
 
 ### 3. The `Entity` Object
 Entities are NOT simple tables. They have a metatable that automatically casts properties.
@@ -31,6 +36,17 @@ Entities are NOT simple tables. They have a metatable that automatically casts p
 - **Methods**: 
   - `entity:is_local_player()` -> bool
   - `entity:distance_to(other_entity_or_table)` -> number
+
+### 3b. The `Obstacle` Object
+Static obstacles (`wall`, destructible `crate`, `trigger` zone) also use an auto-casting metatable:
+- **Geometry & Transform**: `obs.x`, `obs.y`, `obs.shape` (`"aabb"` or `"circle"`), `obs.width`, `obs.height` (for AABB), `obs.radius` (for Circle).
+- **Metadata**: `obs.id`, `obs.blueprint`, `obs.is_solid` (bool), `obs.collision_type` (`"solid"`, `"destructible"`, `"trigger"`).
+- **Dynamic Properties**: Accessed via `obs.prop_name` or `obs:get(key, default)` (e.g., `obs.hp`, `obs.material`).
+- **Methods**:
+  - `obs:bounds()` -> `min_x, min_y, max_x, max_y`
+  - `obs:contains_point(px, py)` -> bool
+  - `obs:intersects_circle(cx, cy, radius)` -> bool
+  - `obs:distance_to(other_or_table)` -> number
 
 ### 4. Sending Intents (Client -> Server)
 - `loci.send_move(dir_x, dir_y)`: Sends a movement intent. The vector does not need to be normalized.
@@ -43,6 +59,9 @@ The developer must assign functions to these callbacks to react to server events
 - `loci.on_entity_spawned = function(entity)`
 - `loci.on_entity_despawned = function(entity_id)`
 - `loci.on_property_changed = function(entity, key, old_val, new_val)`: Ideal for updating UI or VFX.
+- `loci.on_obstacle_spawned = function(obstacle)`
+- `loci.on_obstacle_destroyed = function(obstacle_id, last_obstacle)`: Ideal for crate destruction VFX/SFX.
+- `loci.on_obstacle_property_changed = function(obstacle, key, old_val, new_val)`
 - `loci.on_action_cast = function(entity, ability_id, dir_x, dir_y)`: Fired when an entity successfully casts an ability. Trigger particle effects or sounds here.
 - `loci.on_match_state_changed = function(state, winner)`: `state` is "running", "paused", or "ended".
 - `loci.on_intent_rejected = function(reason)`: Fired if the server denies a client action.
@@ -53,7 +72,7 @@ The developer must assign functions to these callbacks to react to server events
 When asked to implement a game feature:
 1. Put all visual/audio logic inside the event callbacks (e.g., play attack sound in `on_action_cast`).
 2. Map Love2D inputs (`love.keypressed`, `love.mousepressed`) directly to `loci.send_move` and `loci.send_action`.
-3. Read game state directly from `loci.get_entities()` inside `love.draw` to render the game. Do not maintain a separate list of game objects.
+3. Read game state directly from `loci.get_entities()` and `loci.get_obstacles()` inside `love.draw` to render the game. Do not maintain a separate list of game objects.
 
 ### 6. Network Telemetry & Debugging (ADR / Card Telemetria)
 Zero-GC telemetry monitoring for RTT, RFC 3550 Jitter, Packet Loss %, and Tick Frequency.
@@ -70,4 +89,4 @@ Zero-GC telemetry monitoring for RTT, RFC 3550 Jitter, Packet Loss %, and Tick F
 
 ### 7. Server-side scripting tips
 - **Dash ability:** To implement a dash ability that passes through enemies but stops at walls, the server script should use `Loci.Physics.raycast` to find walls and `Loci.Commands.set_collision_filter` to temporarily ignore entities. Always remember to restore the original collision filter!
-
+- **Walls, crates & trigger zones:** Spawn static geometry from `on_init` via `Loci.Commands.spawn_static_obstacle({ blueprint = "crate", position = { x = 10, y = 0 }, width = 4, height = 4, collision_type = "destructible", properties = { hp = 2 } })`. Client prediction automatically resolves against solid obstacles (`obs.is_solid == true`).

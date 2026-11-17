@@ -155,4 +155,34 @@ function entity_module.get_globals(ctx)
     return ctx and ctx.globals or {}
 end
 
+function entity_module.sync_properties(owner, raw_props, is_new, on_changed)
+    local seen = {}
+    if raw_props then
+        for _, prop in ipairs(raw_props) do
+            seen[prop.key] = true
+            local casted_val = entity_module.cast_property_value(prop.value)
+            local old_val = owner.properties[prop.key]
+            if old_val ~= casted_val then
+                owner.properties[prop.key] = casted_val
+                if not is_new and on_changed then
+                    on_changed(owner, prop.key, old_val, casted_val)
+                end
+            end
+        end
+    end
+
+    local to_remove = {}
+    for k, old_val in pairs(owner.properties) do
+        if not seen[k] then
+            table.insert(to_remove, k)
+            if not is_new and on_changed then
+                on_changed(owner, k, old_val, nil)
+            end
+        end
+    end
+    for _, k in ipairs(to_remove) do
+        owner.properties[k] = nil
+    end
+end
+
 return entity_module

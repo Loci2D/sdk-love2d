@@ -1015,13 +1015,327 @@ loci._udp = nil
 loci._mock_time = nil
 
 -- ============================================================================
--- Section 8: Session Resume (session_token Handshake, Watchdog & Socket Resume)
+-- Section 8: Static Obstacles, Lifecycle Callbacks, Spatial Queries & Prediction
 -- ============================================================================
 
-local s8_intents = {}
-local orig_s8_send = loci._send_intent
+local orig_obs_spawned = loci.on_obstacle_spawned
+local orig_obs_destroyed = loci.on_obstacle_destroyed
+local orig_obs_prop = loci.on_obstacle_property_changed
+
+loci.obstacles = {}
+loci._obstacles_list_cache = nil
+loci.entities = {}
+loci._entities_list_cache = nil
+loci.my_entity_id = nil
+loci._player_name = "ObsTester"
+
+local spawned_obs_ids = {}
+local destroyed_obs_records = {}
+local prop_changes = {}
+
+loci.on_obstacle_spawned = function(obs)
+    table.insert(spawned_obs_ids, obs.id)
+end
+
+loci.on_obstacle_destroyed = function(obs_id, last_obs)
+    destroyed_obs_records[obs_id] = last_obs
+end
+
+loci.on_obstacle_property_changed = function(obs, key, old_val, new_val)
+    table.insert(prop_changes, { id = obs.id, key = key, old = old_val, new = new_val })
+end
+
+-- 8.1 Snapshot ingestion: AABB wall, destructible crate, and Circle trigger zone
+loci._handle_world_state({
+    tick = 300,
+    _receive_time = 2000.0,
+    entities = {
+        {
+            id = 900,
+            name = "ObsTester",
+            position = { x_bits = 0, y_bits = 0 },
+            velocity = { x_bits = 0, y_bits = 0 },
+            properties = { { key = "move_speed", value = "3" }, { key = "radius", value = "2" } }
+        }
+    },
+    obstacles = {
+        {
+            id = 2,
+            blueprint = "crate",
+            shape = "OBSTACLE_AABB",
+            position = { x_bits = 6 * 65536, y_bits = 0 },
+            width_bits = 4 * 65536,
+            height_bits = 4 * 65536,
+            radius_bits = 0,
+            is_solid = true,
+            collision_type = "destructible",
+            properties = {
+                { key = "hp", value = "2" },
+                { key = "state", value = "intact" }
+            }
+        },
+        {
+            id = 1,
+            blueprint = "wall",
+            shape = 0, -- Numeric enum value for OBSTACLE_AABB
+            position = { x_bits = 20 * 65536, y_bits = 0 },
+            width_bits = 4 * 65536,
+            height_bits = 20 * 65536,
+            radius_bits = 0,
+            is_solid = true,
+            collision_type = "solid",
+            properties = { { key = "material", value = "stone" } }
+        },
+        {
+            id = 3,
+            blueprint = "heal_zone",
+            shape = "OBSTACLE_CIRCLE",
+            position = { x_bits = -10 * 65536, y_bits = 5 * 65536 },
+            width_bits = 0,
+            height_bits = 0,
+            radius_bits = 5 * 65536,
+            is_solid = false,
+            collision_type = "trigger",
+            properties = { { key = "heal_per_tick", value = "5" }, { key = "active", value = "true" } }
+        }
+    }
+})
+
+assert(#spawned_obs_ids == 3, "All 3 obstacles should trigger on_obstacle_spawned")
+local all_obs = loci.get_obstacles()
+assert(#all_obs == 3, "get_obstacles must return all 3 obstacles")
+-- Sorted deterministically by ascending id
+assert(all_obs[1].id == 1 and all_obs[2].id == 2 and all_obs[3].id == 3, "get_obstacles must be sorted by id ascending")
+
+local wall = loci.get_obstacle(1)
+assert(wall ~= nil and wall.blueprint == "wall" and wall.shape == "aabb", "wall metadata mismatch")
+assert(wall.is_solid == true and wall.collision_type == "solid", "wall solidity mismatch")
+assert(wall.width == 4 and wall.height == 20, "wall AABB dimensions mismatch")
+assert(wall.material == "stone", "wall property metamethod lookup failed")
+assert(wall:contains_point(21, -8) == true, "point inside wall bounds should return true")
+assert(wall:contains_point(25, 0) == false, "point outside wall bounds should return false")
+local w_min_x, w_min_y, w_max_x, w_max_y = wall:bounds()
+assert(w_min_x == 18 and w_max_x == 22 and w_min_y == -10 and w_max_y == 10, "wall:bounds() mismatch")
+
+local crate = loci.get_obstacle(2)
+assert(crate.hp == 2 and type(crate.hp) == "number", "crate.hp must auto-cast to number")
+assert(crate:get("missing", "fallback") == "fallback", "Obstacle:get fallback failed")
+
+local zone = loci.get_obstacle(3)
+assert(zone.shape == "circle" and zone.radius == 5, "circle obstacle shape/radius mismatch")
+assert(zone.is_solid == false and zone.collision_type == "trigger", "trigger solidity mismatch")
+assert(zone.heal_per_tick == 5 and zone.active == true, "trigger properties auto-cast failed")
+assert(zone:contains_point(-10, 9) == true and zone:contains_point(-10, 11) == false, "circle contains_point mismatch")
+
+assert(#loci.get_obstacles_by_blueprint("crate") == 1, "get_obstacles_by_blueprint mismatch")
+assert(#loci.get_solid_obstacles() == 2, "get_solid_obstacles should exclude non-solid triggers")
+
+local near_crate = loci.get_obstacles_in_radius(2, 0, 2.5)
+assert(#near_crate == 1 and near_crate[1].id == 2, "get_obstacles_in_radius must detect AABB overlap at edge x=4")
+
+-- Pooled copy mutation guard
+all_obs[1] = nil
+assert(#loci.get_obstacles() == 3, "Mutating returned get_obstacles() list must not corrupt internal cache")
+
+-- 8.2 Property change diff + destruction callback
+loci._handle_world_state({
+    tick = 301,
+    _receive_time = 2000.033,
+    entities = {
+        { id = 900, name = "ObsTester", position = { x_bits = 0, y_bits = 0 }, velocity = { x_bits = 0, y_bits = 0 } }
+    },
+    obstacles = {
+        {
+            id = 2,
+            blueprint = "crate",
+            shape = "OBSTACLE_AABB",
+            position = { x_bits = 6 * 65536, y_bits = 0 },
+            width_bits = 4 * 65536,
+            height_bits = 4 * 65536,
+            is_solid = true,
+            collision_type = "destructible",
+            properties = { { key = "hp", value = "1" } }
+        },
+        {
+            id = 1,
+            blueprint = "wall",
+            shape = "OBSTACLE_AABB",
+            position = { x_bits = 20 * 65536, y_bits = 0 },
+            width_bits = 4 * 65536,
+            height_bits = 20 * 65536,
+            is_solid = true,
+            collision_type = "solid",
+            properties = { { key = "material", value = "stone" } }
+        }
+        -- id 3 removed
+    }
+})
+
+assert(destroyed_obs_records[3] ~= nil and destroyed_obs_records[3].blueprint == "heal_zone", "on_obstacle_destroyed must receive last known obstacle")
+assert(loci.get_obstacle(3) == nil and #loci.get_obstacles() == 2, "destroyed obstacle must be removed")
+assert(#prop_changes == 2, "hp changed (2->1) and state removed (intact->nil) must fire on_obstacle_property_changed")
+
+-- Clearing all obstacles (empty/nil repeated field in proto3)
+loci._handle_world_state({
+    tick = 302,
+    _receive_time = 2000.066,
+    entities = {
+        { id = 900, name = "ObsTester", position = { x_bits = 0, y_bits = 0 }, velocity = { x_bits = 0, y_bits = 0 } }
+    }
+})
+assert(destroyed_obs_records[2] ~= nil and destroyed_obs_records[1] ~= nil, "Remaining obstacles must destroy when obstacles list is nil/empty")
+assert(#loci.get_obstacles() == 0, "get_obstacles should be empty after all obstacles removed")
+
+-- 8.3 Client-side prediction obstacle collision + wall sliding
+local pred_submod = require("loci.netcode.prediction")
+loci.netcode.prediction_enabled = true
+loci.netcode.obstacle_collision_prediction = true
+loci.netcode.default_entity_radius = 2.0
+loci.entities = {}
+loci._entities_list_cache = nil
+loci.my_entity_id = nil
+loci.obstacles = {}
+loci._obstacles_list_cache = nil
+
+loci._handle_world_state({
+    tick = 310,
+    _receive_time = 2001.000,
+    entities = {
+        {
+            id = 900,
+            name = "ObsTester",
+            position = { x_bits = 7 * 65536, y_bits = 0 },
+            velocity = { x_bits = 0, y_bits = 0 },
+            properties = { { key = "move_speed", value = "3" }, { key = "radius", value = "2" } }
+        }
+    },
+    obstacles = {
+        {
+            id = 10,
+            blueprint = "wall",
+            shape = "OBSTACLE_AABB",
+            position = { x_bits = 12 * 65536, y_bits = 0 }, -- x in [10, 14]
+            width_bits = 4 * 65536,
+            height_bits = 20 * 65536,
+            is_solid = true,
+            collision_type = "solid"
+        },
+        {
+            id = 11,
+            blueprint = "trigger",
+            shape = "OBSTACLE_CIRCLE",
+            position = { x_bits = 8 * 65536, y_bits = 0 },
+            radius_bits = 4 * 65536,
+            is_solid = false,
+            collision_type = "trigger"
+        },
+        {
+            id = 12,
+            blueprint = "pillar",
+            shape = "OBSTACLE_CIRCLE",
+            position = { x_bits = 0, y_bits = 12 * 65536 }, -- pillar center (0, 12), radius 2
+            radius_bits = 2 * 65536,
+            is_solid = true,
+            collision_type = "solid"
+        }
+    }
+})
+
+local obs_tester = loci.get_my_entity()
+loci._mock_time = 2001.050
+loci.send_move(1, 1) -- diagonal SE against wall at min_x=10
+loci.update(0.050)
+-- Without obstacle collision, x = 7 + (0.707 * 90 * 0.05) = 10.18 -> penetrates wall boundary x=8 (10 - radius 2)
+assert(obs_tester.x <= 8.001, "Predicted local player must stop at AABB wall edge x=8.0, got " .. tostring(obs_tester.x))
+assert(obs_tester.y > 0.5, "Wall sliding along Y must preserve tangential movement, got y=" .. tostring(obs_tester.y))
+assert(math.abs(obs_tester.vx) < 0.001 and obs_tester.vy > 0, "Normal velocity component into wall must be zeroed while tangent stays positive")
+
+-- Circle pillar collision pushback check
+obs_tester.x = 0
+obs_tester.y = 9.0 -- overlapping pillar at (0, 12) radius 2 + player radius 2 => min dist 4 => y should push to 8.0
+pred_submod.resolve_obstacle_collisions(obs_tester, loci.get_obstacles(), 2.0)
+assert(math.abs(obs_tester.y - 8.0) < 0.001, "Circle pillar pushback should place entity at y=8.0, got " .. tostring(obs_tester.y))
+
+-- 8.4 Full Protobuf binary roundtrip (schema.lua + pb) when lua-protobuf is loaded
+local orig_match_cb = loci.on_match_state_changed
+local orig_match_state = loci.match_state
+local orig_match_winner = loci.match_winner
+loci.on_match_state_changed = function() end
+
+if ok_pb and pb then
+    local loaded = schema_submod.load("lib/")
+    assert(loaded, "schema.load('lib/') must succeed with updated game_packets.proto")
+    loci._schema_loaded = true
+    loci.obstacles = {}
+    loci._obstacles_list_cache = nil
+
+    local raw_pkt = pb.encode("loci2d.ServerPacket", {
+        sequence_id = 42,
+        world_state = {
+            tick = 400,
+            timestamp = 2500,
+            entities = {
+                {
+                    id = 900,
+                    name = "ObsTester",
+                    position = { x_bits = 0, y_bits = 0 },
+                    velocity = { x_bits = 0, y_bits = 0 }
+                }
+            },
+            obstacles = {
+                {
+                    id = 55,
+                    blueprint = "crate",
+                    shape = "OBSTACLE_AABB",
+                    position = { x_bits = 15 * 65536, y_bits = -3 * 65536 },
+                    width_bits = 4 * 65536,
+                    height_bits = 4 * 65536,
+                    is_solid = true,
+                    collision_type = "destructible",
+                    properties = { { key = "hp", value = "3" } }
+                },
+                {
+                    id = 56,
+                    blueprint = "portal",
+                    shape = "OBSTACLE_CIRCLE",
+                    position = { x_bits = -8 * 65536, y_bits = 4 * 65536 },
+                    radius_bits = 3 * 65536,
+                    is_solid = false,
+                    collision_type = "trigger",
+                    properties = { { key = "active", value = "true" } }
+                }
+            }
+        }
+    })
+    assert(raw_pkt ~= nil and #raw_pkt > 0, "Protobuf encode of ServerPacket with obstacles must succeed")
+    loci._mock_time = 2002.000
+    loci._dispatch_raw_packet(raw_pkt)
+
+    local pb_crate = loci.get_obstacle(55)
+    local pb_portal = loci.get_obstacle(56)
+    assert(pb_crate ~= nil and pb_crate.x == 15 and pb_crate.y == -3 and pb_crate.width == 4 and pb_crate.is_solid == true and pb_crate.hp == 3, "Protobuf crate roundtrip mismatch")
+    assert(pb_portal ~= nil and pb_portal.shape == "circle" and pb_portal.x == -8 and pb_portal.y == 4 and pb_portal.radius == 3 and pb_portal.is_solid == false and pb_portal.active == true, "Protobuf circle trigger roundtrip mismatch")
+end
+
+-- Cleanup Section 8 state
+loci.on_match_state_changed = orig_match_cb
+loci.match_state = orig_match_state
+loci.match_winner = orig_match_winner
+loci.on_obstacle_spawned = orig_obs_spawned
+loci.on_obstacle_destroyed = orig_obs_destroyed
+loci.on_obstacle_property_changed = orig_obs_prop
+loci.obstacles = {}
+loci._obstacles_list_cache = nil
+loci._mock_time = nil
+
+-- ============================================================================
+-- Section 9: Session Resume (session_token Handshake, Watchdog & Socket Resume)
+-- ============================================================================
+
+local s9_intents = {}
+local orig_s9_send = loci._send_intent
 loci._send_intent = function(intent_table)
-    table.insert(s8_intents, intent_table)
+    table.insert(s9_intents, intent_table)
 end
 
 loci.entities = {}
@@ -1031,10 +1345,10 @@ loci._player_name = "ResumeHero"
 loci.set_session_token(nil)
 assert(loci.get_session_token() == nil, "session_token must start nil")
 
--- 8.1 Initial JoinIntent has no session_token; ServerResponse stores token
+-- 9.1 Initial JoinIntent has no session_token; ServerResponse stores token
 loci._send_join_intent()
-assert(#s8_intents == 1 and s8_intents[1].join ~= nil, "initial join intent must be emitted")
-assert(s8_intents[1].join.session_token == nil, "initial join must omit session_token when nil")
+assert(#s9_intents == 1 and s9_intents[1].join ~= nil, "initial join intent must be emitted")
+assert(s9_intents[1].join.session_token == nil, "initial join must omit session_token when nil")
 
 loci._handle_response({
     sequence_id = 1,
@@ -1058,8 +1372,8 @@ loci._handle_world_state({
 })
 assert(loci.my_entity_id == 801, "my_entity_id must bind to 801")
 
--- 8.2 Watchdog timeout & join retry automatically attach session_token
-s8_intents = {}
+-- 9.2 Watchdog timeout & join retry automatically attach session_token
+s9_intents = {}
 loci._udp = {
     send = function() end,
     receive = function() return nil, "timeout" end,
@@ -1070,25 +1384,25 @@ loci.netcode.connection_timeout = 4.0
 loci._last_packet_received_time = 3000.0
 loci._mock_time = 3005.0 -- > 4.0s triggers watchdog
 
-local s8_lost_called = false
-local orig_s8_lost = loci.on_connection_lost
-loci.on_connection_lost = function(reason) s8_lost_called = true end
+local s9_lost_called = false
+local orig_s9_lost = loci.on_connection_lost
+loci.on_connection_lost = function(reason) s9_lost_called = true end
 
 loci.update(0.016)
-assert(s8_lost_called == true, "on_connection_lost must fire on timeout")
+assert(s9_lost_called == true, "on_connection_lost must fire on timeout")
 assert(loci.my_entity_id == nil, "my_entity_id cleared during reconnect")
 assert(loci.get_session_token() == "tok_resume_999", "session_token must be preserved across timeout")
-assert(#s8_intents == 1 and s8_intents[1].join ~= nil, "watchdog must emit reconnect JoinIntent")
-assert(s8_intents[1].join.session_token == "tok_resume_999", "watchdog JoinIntent must include stored session_token")
+assert(#s9_intents == 1 and s9_intents[1].join ~= nil, "watchdog must emit reconnect JoinIntent")
+assert(s9_intents[1].join.session_token == "tok_resume_999", "watchdog JoinIntent must include stored session_token")
 
 -- Retry cadence (1.0s while reconnecting) also sends session_token
 loci._mock_time = 3006.1
 loci.update(0.016)
-assert(#s8_intents == 2 and s8_intents[2].join.session_token == "tok_resume_999", "retry JoinIntent must include stored session_token")
+assert(#s9_intents == 2 and s9_intents[2].join.session_token == "tok_resume_999", "retry JoinIntent must include stored session_token")
 
 -- Server responds with status="resumed" and next WorldState fires on_reconnected
-local s8_reconnected_id = nil
-loci.on_reconnected = function(id) s8_reconnected_id = id end
+local s9_reconnected_id = nil
+loci.on_reconnected = function(id) s9_reconnected_id = id end
 loci._handle_response({
     sequence_id = 2,
     status = "resumed",
@@ -1107,14 +1421,14 @@ loci._handle_world_state({
         }
     }
 })
-assert(s8_reconnected_id == 801, "on_reconnected must fire with original entity_id 801")
+assert(s9_reconnected_id == 801, "on_reconnected must fire with original entity_id 801")
 assert(loci.get_my_entity().team == "Red" and loci.get_my_entity().score == 25, "resumed entity properties must be preserved")
 
--- 8.3 Explicit disconnect clears session_token
+-- 9.3 Explicit disconnect clears session_token
 loci.disconnect("quit match")
 assert(loci.get_session_token() == nil, "explicit disconnect must clear session_token")
 
--- 8.4 Protobuf binary roundtrip for JoinIntent.session_token and ServerResponse.session_token
+-- 9.4 Protobuf binary roundtrip for JoinIntent.session_token and ServerResponse.session_token
 if ok_pb and pb then
     local loaded = schema_submod.load("lib/")
     assert(loaded, "schema.load('lib/') must succeed")
@@ -1145,9 +1459,9 @@ if ok_pb and pb then
     assert(loci.get_session_token() == "pb_tok_12345", "_dispatch_raw_packet must capture ServerResponse.session_token")
 end
 
--- Cleanup Section 8
-loci._send_intent = orig_s8_send
-loci.on_connection_lost = orig_s8_lost
+-- Cleanup Section 9
+loci._send_intent = orig_s9_send
+loci.on_connection_lost = orig_s9_lost
 loci.on_reconnected = orig_reconnected_cb
 loci.set_session_token(nil)
 loci._udp = nil
