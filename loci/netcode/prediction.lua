@@ -35,6 +35,101 @@ function prediction_module.is_incapacitated(entity, cur_tick)
     return (cur_tick < stunned_until) or (cur_tick < paralyzed_until)
 end
 
+local function apply_static_mtv(entity, nx, ny, penetration)
+    if penetration <= 0 then return end
+    entity.x = entity.x + nx * penetration
+    entity.y = entity.y + ny * penetration
+
+    local vx = entity.vx or 0
+    local vy = entity.vy or 0
+    local dot = vx * nx + vy * ny
+    if dot < 0 then
+        entity.vx = vx - nx * dot
+        entity.vy = vy - ny * dot
+    end
+end
+
+local function resolve_single_obstacle(entity, obs, radius)
+    if not obs or not obs.is_solid then return end
+
+    if obs.shape == "circle" then
+        local dx = entity.x - (obs.x or 0)
+        local dy = entity.y - (obs.y or 0)
+        local sum_r = radius + (obs.radius or 0)
+        local dist2 = dx * dx + dy * dy
+        if dist2 < (sum_r * sum_r) then
+            if dist2 > 1e-12 then
+                local dist = math.sqrt(dist2)
+                apply_static_mtv(entity, dx / dist, dy / dist, sum_r - dist)
+            else
+                apply_static_mtv(entity, 1.0, 0.0, sum_r)
+            end
+        end
+        return
+    end
+
+    local hw = (obs.width or 0) * 0.5
+    local hh = (obs.height or 0) * 0.5
+    local ox = obs.x or 0
+    local oy = obs.y or 0
+    local min_x, max_x = ox - hw, ox + hw
+    local min_y, max_y = oy - hh, oy + hh
+
+    local px = math.max(min_x, math.min(entity.x, max_x))
+    local py = math.max(min_y, math.min(entity.y, max_y))
+
+    if px ~= entity.x or py ~= entity.y then
+        local dx = entity.x - px
+        local dy = entity.y - py
+        local dist2 = dx * dx + dy * dy
+        if dist2 < (radius * radius) then
+            local dist = math.sqrt(dist2)
+            if dist > 1e-12 then
+                apply_static_mtv(entity, dx / dist, dy / dist, radius - dist)
+            else
+                apply_static_mtv(entity, 1.0, 0.0, radius)
+            end
+        end
+    else
+        local dist_left = entity.x - min_x
+        local dist_right = max_x - entity.x
+        local dist_bottom = entity.y - min_y
+        local dist_top = max_y - entity.y
+
+        local min_dist = dist_right
+        local nx, ny = 1.0, 0.0
+        if dist_left < min_dist then
+            min_dist = dist_left
+            nx, ny = -1.0, 0.0
+        end
+        if dist_top < min_dist then
+            min_dist = dist_top
+            nx, ny = 0.0, 1.0
+        end
+        if dist_bottom < min_dist then
+            min_dist = dist_bottom
+            nx, ny = 0.0, -1.0
+        end
+        apply_static_mtv(entity, nx, ny, radius + min_dist)
+    end
+end
+
+function prediction_module.resolve_obstacle_collisions(entity, obstacles, entity_radius)
+    if not entity or not obstacles then return end
+    local radius = entity_radius or (entity.get and tonumber(entity:get("radius"))) or 2.0
+    if radius <= 0 then return end
+
+    if #obstacles > 0 then
+        for _, obs in ipairs(obstacles) do
+            resolve_single_obstacle(entity, obs, radius)
+        end
+    else
+        for _, obs in pairs(obstacles) do
+            resolve_single_obstacle(entity, obs, radius)
+        end
+    end
+end
+
 function prediction_module.predict_local_player(entity, ctx, dt, tick_rate, prediction_starved)
     local cur_tick = ctx._last_state_tick or 0
     local dashing_until = tonumber(entity:get("dashing_until")) or 0
@@ -75,6 +170,14 @@ function prediction_module.predict_local_player(entity, ctx, dt, tick_rate, pred
                 entity.vy = 0
             end
         end
+    end
+
+    local collide_obstacles = not (ctx.netcode and ctx.netcode.obstacle_collision_prediction == false)
+    if collide_obstacles and not incapacitated and not prediction_starved and ctx.obstacles and next(ctx.obstacles) ~= nil then
+        local list = ctx.get_obstacles and ctx.get_obstacles() or ctx.obstacles
+        local default_radius = (ctx.netcode and ctx.netcode.default_entity_radius) or 2.0
+        local radius = (entity.get and tonumber(entity:get("radius"))) or default_radius
+        prediction_module.resolve_obstacle_collisions(entity, list, radius)
     end
 end
 

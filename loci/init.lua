@@ -10,6 +10,7 @@ local modname = ... or "loci"
 local prefix = (modname:match("^(.-)init$") or (modname .. ".")):gsub("%.+$", ".")
 
 local entity_mod = require(prefix .. "entity")
+local obstacle_mod = require(prefix .. "obstacle")
 local schema_mod = require(prefix .. "network.schema")
 local protocol_mod = require(prefix .. "network.protocol")
 local transport_mod = require(prefix .. "network.transport")
@@ -27,6 +28,7 @@ local loci = {
     COMPATIBLE_ENGINE_VERSION = "0.6.x",
     SCHEMA_VERSION = 1,
     entities = {},
+    obstacles = {},
     globals = {},
     my_entity_id = nil,
     match_state = "running",
@@ -36,6 +38,8 @@ local loci = {
     -- Netcode & Latency Compensation Configuration (ADR 0001, ADR 0002 & ADR 0003)
     netcode = {
         prediction_enabled = true,
+        obstacle_collision_prediction = true, -- Resolve predicted movement against solid obstacles
+        default_entity_radius = 2.0,      -- Matches server default entity collider radius
         interpolation_delay = 0.050,      -- 50ms buffer (safe for 30Hz LAN Wi-Fi)
         reconciliation_threshold = 2.0,    -- 2px tolerance
         snap_threshold = 50.0,             -- 50px max error before hard snap
@@ -64,6 +68,9 @@ local loci = {
     on_entity_spawned = function(entity) end,
     on_entity_despawned = function(entity_id) end,
     on_property_changed = function(entity, key, old_val, new_val) end,
+    on_obstacle_spawned = function(obstacle) end,
+    on_obstacle_destroyed = function(obstacle_id, obstacle) end,
+    on_obstacle_property_changed = function(obstacle, key, old_val, new_val) end,
     on_match_state_changed = function(state, winner) end,
     on_action_cast = function(entity, ability_id, dir_x, dir_y) end,
     on_intent_rejected = function(reason) end,
@@ -91,6 +98,8 @@ local loci = {
     _player_name = nil,
     _base_path = "lib/",
     _entities_list_cache = nil,
+    _obstacles_list_cache = nil,
+    _public_obstacles_list = nil,
     _snapshot_buffer = {},
     _max_snapshot_history = 20,
     _prediction_handler = nil,
@@ -99,8 +108,9 @@ local loci = {
     _inflight_intents = {},
 }
 
--- Bind context so Entity metatable can inspect loci state
+-- Bind context so Entity and Obstacle metatables can inspect loci state
 entity_mod.bind_context(loci)
+obstacle_mod.bind_context(loci)
 
 function loci.get_server_tick_rate()
     return loci.server_tick_rate or 30.0
@@ -122,6 +132,8 @@ function loci.get_snapshot_buffer()
 end
 
 function loci.connect(host, port, player_name, base_path, tick_rate)
+    loci.obstacles = {}
+    loci._obstacles_list_cache = nil
     loci._snapshot_buffer = {}
     loci._active_move_dx = 0
     loci._active_move_dy = 0
@@ -165,6 +177,8 @@ function loci.connect(host, port, player_name, base_path, tick_rate)
 end
 
 function loci.disconnect(reason)
+    loci.obstacles = {}
+    loci._obstacles_list_cache = nil
     loci._snapshot_buffer = {}
     loci._active_move_dx = 0
     loci._active_move_dy = 0
@@ -278,6 +292,26 @@ end
 
 function loci.get_globals()
     return entity_mod.get_globals(loci)
+end
+
+function loci.get_obstacles()
+    return obstacle_mod.get_obstacles(loci)
+end
+
+function loci.get_obstacle(id)
+    return obstacle_mod.get_obstacle(loci, id)
+end
+
+function loci.get_obstacles_by_blueprint(blueprint_name)
+    return obstacle_mod.get_obstacles_by_blueprint(loci, blueprint_name)
+end
+
+function loci.get_solid_obstacles()
+    return obstacle_mod.get_solid_obstacles(loci)
+end
+
+function loci.get_obstacles_in_radius(center_x, center_y, radius)
+    return obstacle_mod.get_obstacles_in_radius(loci, center_x, center_y, radius)
 end
 
 function loci._interpolate_remote_entity(entity, render_time, tick_rate)
@@ -443,33 +477,7 @@ function loci._handle_world_state(state)
             end
 
             -- Diff properties with auto-casting
-            local new_props = {}
-            if raw_ent.properties then
-                for _, prop in ipairs(raw_ent.properties) do
-                    new_props[prop.key] = true
-                    local casted_val = entity_mod.cast_property_value(prop.value)
-                    local old_val = ent.properties[prop.key]
-                    if old_val ~= casted_val then
-                        ent.properties[prop.key] = casted_val
-                        if not is_new and loci.on_property_changed then
-                            loci.on_property_changed(ent, prop.key, old_val, casted_val)
-                        end
-                    end
-                end
-            end
-            -- Check for removed properties
-            local to_remove = {}
-            for k, old_val in pairs(ent.properties) do
-                if not new_props[k] then
-                    table.insert(to_remove, k)
-                    if not is_new and loci.on_property_changed then
-                        loci.on_property_changed(ent, k, old_val, nil)
-                    end
-                end
-            end
-            for _, k in ipairs(to_remove) do
-                ent.properties[k] = nil
-            end
+            entity_mod.sync_properties(ent, raw_ent.properties, is_new, loci.on_property_changed)
 
             if is_new then
                 loci.entities[entity_id] = ent
@@ -498,6 +506,44 @@ function loci._handle_world_state(state)
             if loci.my_entity_id == id then
                 loci.my_entity_id = nil
             end
+        end
+    end
+
+    -- Ingest and diff static obstacles
+    local new_obstacles = {}
+    if state.obstacles then
+        for _, raw_obs in ipairs(state.obstacles) do
+            local obs_id = raw_obs.id
+            local obs = loci.obstacles[obs_id]
+            local is_new = false
+            if not obs then
+                is_new = true
+                obs = obstacle_mod.new_obstacle(obs_id, raw_obs.blueprint)
+            end
+
+            obstacle_mod.apply_snapshot(obs, raw_obs)
+            entity_mod.sync_properties(obs, raw_obs.properties, is_new, loci.on_obstacle_property_changed)
+
+            if is_new then
+                loci.obstacles[obs_id] = obs
+                loci._obstacles_list_cache = nil
+                if loci.on_obstacle_spawned then
+                    loci.on_obstacle_spawned(obs)
+                end
+            end
+
+            new_obstacles[obs_id] = true
+        end
+    end
+
+    -- Destroy obstacles not in the new state
+    for id, obs in pairs(loci.obstacles) do
+        if not new_obstacles[id] then
+            if loci.on_obstacle_destroyed then
+                loci.on_obstacle_destroyed(id, obs)
+            end
+            loci.obstacles[id] = nil
+            loci._obstacles_list_cache = nil
         end
     end
 
