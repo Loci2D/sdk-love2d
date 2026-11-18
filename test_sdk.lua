@@ -110,7 +110,7 @@ loci._handle_response({ status = "rejected: Stunned" })
 assert(intent_rejected_called, "on_intent_rejected must be triggered")
 
 -- Test version metadata
-assert(loci.VERSION == "0.6.4", "loci.VERSION should be 0.6.4")
+assert(loci.VERSION == "0.6.5", "loci.VERSION should be 0.6.5")
 assert(loci.COMPATIBLE_ENGINE_VERSION == "0.6.x", "loci.COMPATIBLE_ENGINE_VERSION should be 0.6.x")
 
 -- Test netcode configuration defaults (ADR 0001)
@@ -766,7 +766,7 @@ loci._mock_time = nil
 -- 6.1 Direct require("loci") parity check
 local direct_loci = require("loci")
 assert(direct_loci == loci, "require('loci') must return the exact same instance as require('loci_client')")
-assert(direct_loci.VERSION == "0.6.4", "direct_loci.VERSION must be 0.6.4")
+assert(direct_loci.VERSION == "0.6.5", "direct_loci.VERSION must be 0.6.5")
 
 -- 6.2 Entity submodule direct test
 local entity_mod = require("loci.entity")
