@@ -58,6 +58,23 @@ for _, pat in ipairs(path_candidates) do
     end
 end
 
+-- On Android, native libraries in APK jniLibs/<abi>/ must be named lib*.so (e.g. libpb.so).
+-- Ensure matching lib?.so patterns exist alongside ?.so entries in package.cpath.
+if love and love.system and love.system.getOS and love.system.getOS() == "Android" then
+    local extra_cpaths = {}
+    for entry in package.cpath:gmatch("[^;]+") do
+        if entry:sub(-4) == "?.so" and entry:sub(-7) ~= "lib?.so" then
+            local lib_entry = entry:sub(1, -5) .. "lib?.so"
+            if not package.cpath:find(lib_entry, 1, true) then
+                table.insert(extra_cpaths, lib_entry)
+            end
+        end
+    end
+    if #extra_cpaths > 0 then
+        package.cpath = package.cpath .. ";" .. table.concat(extra_cpaths, ";")
+    end
+end
+
 -- Attempt to load lua-protobuf library and protoc parser
 local ok_pb, res_pb = pcall(require, "pb")
 if ok_pb then
