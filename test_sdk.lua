@@ -1467,4 +1467,160 @@ loci.set_session_token(nil)
 loci._udp = nil
 loci._mock_time = nil
 
+-- ============================================================================
+-- 10. Physical Projectiles: EntityType, Queries, Smooth Motion & Despawn Entity
+-- ============================================================================
+print("Testing Physical Projectiles (EntityType, Queries, Interpolation & Despawn)...")
+
+loci.entities = {}
+loci._entities_list_cache = nil
+loci._snapshot_buffer = {}
+loci.my_entity_id = nil
+loci.server_tick_rate = 30.0
+loci.netcode.interpolation_delay = 0.050
+loci.netcode.snap_threshold = 50.0
+
+local orig_spawned_10 = loci.on_entity_spawned
+local orig_despawned_10 = loci.on_entity_despawned
+local orig_match_state_10 = loci.on_match_state_changed
+local spawned_10 = {}
+local despawned_10 = {}
+
+loci.match_state = "running"
+loci.on_match_state_changed = function() end
+loci.on_entity_spawned = function(ent)
+    spawned_10[ent.id] = ent
+end
+loci.on_entity_despawned = function(id, ent)
+    despawned_10[id] = ent
+end
+
+-- Seed two initial snapshots with only a player so render_time lags behind newest snapshot
+loci._handle_world_state({
+    tick = 600,
+    _receive_time = 4000.000,
+    entities = {
+        { id = 10, name = "Hero", entity_type = 0, position = { x_bits = 0, y_bits = 0 }, velocity = { x_bits = 0, y_bits = 0 } }
+    }
+})
+loci._handle_world_state({
+    tick = 601,
+    _receive_time = 4000.033,
+    entities = {
+        { id = 10, name = "Hero", entity_type = "PLAYER", position = { x_bits = 0, y_bits = 0 }, velocity = { x_bits = 0, y_bits = 0 } }
+    }
+})
+
+-- Tick 602: Two projectiles spawn (one with numeric enum 3, one with string "PROJECTILE")
+loci._handle_world_state({
+    tick = 602,
+    _receive_time = 4000.066,
+    entities = {
+        { id = 10, name = "Hero", entity_type = 0, position = { x_bits = 0, y_bits = 0 }, velocity = { x_bits = 0, y_bits = 0 } },
+        { id = 906, name = "blade", entity_type = "PROJECTILE", position = { x_bits = 0, y_bits = 10 * 65536 }, velocity = { x_bits = 1 * 65536, y_bits = 0 } },
+        { id = 905, name = "fireball", entity_type = 3, position = { x_bits = 0, y_bits = 0 }, velocity = { x_bits = 2 * 65536, y_bits = 0 }, properties = { { key = "damage", value = "80" } } }
+    }
+})
+
+local hero = loci.entities[10]
+local fireball = loci.entities[905]
+local blade = loci.entities[906]
+
+assert(hero:is_player() == true and hero:is_projectile() == false, "Hero must normalize to player")
+assert(fireball ~= nil and fireball.entity_type == "projectile" and fireball:is_projectile() == true, "Numeric entity_type=3 must map to projectile")
+assert(blade ~= nil and blade.entity_type == "projectile" and blade:is_projectile() == true, "String entity_type='PROJECTILE' must map to projectile")
+assert(fireball.damage == 80, "Projectile properties must auto-cast")
+
+local projs = loci.get_projectiles()
+assert(#projs == 2 and projs[1].id == 905 and projs[2].id == 906, "get_projectiles must return projectiles sorted by ascending id")
+assert(#loci.get_entities_by_type("PLAYER") == 1, "get_entities_by_type must normalize uppercase enum strings")
+assert(#loci.get_entities_by_type("invalid_type") == 0, "get_entities_by_type with unknown type must return empty list")
+
+local unknown_ent = entity_mod.new_entity(998, "mystery", 99)
+assert(unknown_ent.entity_type == "unknown" and not unknown_ent:is_prop(), "Unrecognized entity_type must become 'unknown', not 'prop'")
+
+-- Zero 50ms spawn freeze check: at t = 4000.082 (16ms after spawn), fireball must already move forward
+local dt_since_snap1 = 4000.082 - 4000.066
+local expected_x1 = 0 + 2 * loci.server_tick_rate * dt_since_snap1
+loci._mock_time = 4000.082
+loci.update(0.016)
+assert(math.abs(fireball.x - expected_x1) < 0.001, "Newly spawned projectile must move immediately without 50ms freeze, got x=" .. tostring(fireball.x))
+
+-- Tick 603 confirms fireball at x = 2.0; updating 16ms later moves smoothly forward without backward jump
+loci._handle_world_state({
+    tick = 603,
+    _receive_time = 4000.099,
+    entities = {
+        { id = 10, name = "Hero", entity_type = 0, position = { x_bits = 0, y_bits = 0 }, velocity = { x_bits = 0, y_bits = 0 } },
+        { id = 905, name = "fireball", entity_type = 3, position = { x_bits = 2 * 65536, y_bits = 0 }, velocity = { x_bits = 2 * 65536, y_bits = 0 }, properties = { { key = "damage", value = "80" } } }
+    }
+})
+
+-- Blade (906) despawned on tick 603; verify on_entity_despawned receives (id, ent) with final server coords
+assert(despawned_10[906] ~= nil, "on_entity_despawned must fire for despawned projectile 906")
+assert(despawned_10[906]:is_projectile() == true, "on_entity_despawned 2nd arg must be Entity object")
+assert(despawned_10[906].x == 0 and despawned_10[906].y == 10, "on_entity_despawned entity must snap to final server coordinates")
+
+local dt_since_snap2 = 4000.115 - 4000.099
+local expected_x2 = 2.0 + 2 * loci.server_tick_rate * dt_since_snap2
+loci._mock_time = 4000.115
+loci.update(0.016)
+assert(math.abs(fireball.x - expected_x2) < 0.001, "Projectile must continue moving smoothly on second snapshot, got x=" .. tostring(fireball.x))
+
+-- Despawn fireball after advancing visually ahead; verify x snaps back to authoritative server_x (2.0)
+loci._handle_world_state({
+    tick = 604,
+    _receive_time = 4000.132,
+    entities = {
+        { id = 10, name = "Hero", entity_type = 0, position = { x_bits = 0, y_bits = 0 }, velocity = { x_bits = 0, y_bits = 0 } }
+    }
+})
+assert(despawned_10[905] ~= nil and despawned_10[905].x == 2.0 and despawned_10[905].y == 0.0, "Despawned projectile must report final server position (2.0, 0.0)")
+
+-- 10.2 Fast projectile > snap_threshold under linear interpolation (now == nil) must not snap
+local fast_proj = entity_mod.new_entity(999, "rail", 3)
+local fast_buf = {
+    { tick = 1, receive_time = 10.0, entities = { [999] = { x = 0, y = 0, vx = 80, vy = 0 } } },
+    { tick = 2, receive_time = 10.1, entities = { [999] = { x = 80, y = 0, vx = 80, vy = 0 } } }
+}
+interp_mod.interpolate_remote_entity(fast_proj, fast_buf, 10.025, 30.0, 50.0)
+assert(math.abs(fast_proj.x - 20.0) < 0.001, "Fast projectile > snap_threshold must linearly interpolate instead of snapping, got x=" .. tostring(fast_proj.x))
+
+-- 10.3 Protobuf binary roundtrip for EntityType.PROJECTILE
+if ok_pb and pb then
+    local loaded = schema_submod.load("lib/")
+    assert(loaded, "schema.load('lib/') must succeed")
+    local encoded_ws = pb.encode("loci2d.ServerPacket", {
+        sequence_id = 88,
+        world_state = {
+            tick = 700,
+            timestamp = 23333,
+            entities = {
+                {
+                    id = 950,
+                    name = "pb_bolt",
+                    entity_type = "PROJECTILE",
+                    position = { x_bits = 12 * 65536, y_bits = -3 * 65536 },
+                    velocity = { x_bits = 15 * 65536, y_bits = 0 }
+                }
+            }
+        }
+    })
+    loci.entities = {}
+    loci._mock_time = 5000.0
+    loci._dispatch_raw_packet(encoded_ws)
+    local pb_bolt = loci.entities[950]
+    assert(pb_bolt ~= nil and pb_bolt:is_projectile() == true and pb_bolt.x == 12 and pb_bolt.y == -3, "Protobuf WorldState with EntityType.PROJECTILE must decode cleanly")
+else
+    print("[SKIPPED] Section 10.3 binary protobuf roundtrip (pb.so not loaded in pure-Lua fallback pass)")
+end
+
+-- Cleanup Section 10
+loci.on_entity_spawned = orig_spawned_10
+loci.on_entity_despawned = orig_despawned_10
+loci.on_match_state_changed = orig_match_state_10
+loci.entities = {}
+loci._snapshot_buffer = {}
+loci._mock_time = nil
+
 print("All loci_client.lua SDK unit tests passed successfully!")

@@ -66,7 +66,7 @@ local loci = {
 
     -- Callbacks
     on_entity_spawned = function(entity) end,
-    on_entity_despawned = function(entity_id) end,
+    on_entity_despawned = function(entity_id, last_entity) end,
     on_property_changed = function(entity, key, old_val, new_val) end,
     on_obstacle_spawned = function(obstacle) end,
     on_obstacle_destroyed = function(obstacle_id, obstacle) end,
@@ -315,6 +315,14 @@ function loci.get_entities_by_blueprint(blueprint_name)
     return entity_mod.get_entities_by_blueprint(loci, blueprint_name)
 end
 
+function loci.get_entities_by_type(entity_type)
+    return entity_mod.get_entities_by_type(loci, entity_type)
+end
+
+function loci.get_projectiles()
+    return entity_mod.get_projectiles(loci)
+end
+
 function loci.get_entities_in_radius(center_x, center_y, radius)
     return entity_mod.get_entities_in_radius(loci, center_x, center_y, radius)
 end
@@ -347,8 +355,8 @@ function loci.get_obstacles_in_radius(center_x, center_y, radius)
     return obstacle_mod.get_obstacles_in_radius(loci, center_x, center_y, radius)
 end
 
-function loci._interpolate_remote_entity(entity, render_time, tick_rate)
-    interp_mod.interpolate_remote_entity(entity, loci._snapshot_buffer, render_time, tick_rate, loci.netcode and loci.netcode.snap_threshold)
+function loci._interpolate_remote_entity(entity, render_time, tick_rate, now)
+    interp_mod.interpolate_remote_entity(entity, loci._snapshot_buffer, render_time, tick_rate, loci.netcode and loci.netcode.snap_threshold, now)
 end
 
 function loci._dispatch_raw_packet(data)
@@ -375,7 +383,7 @@ function loci.update(dt)
                 pred_mod.lerp_server_fallback(entity, dt, tick_rate, (loci.netcode and loci.netcode.snap_threshold) or 50.0, prediction_starved)
             end
         else
-            interp_mod.interpolate_remote_entity(entity, loci._snapshot_buffer, render_time, tick_rate, (loci.netcode and loci.netcode.snap_threshold) or 50.0)
+            interp_mod.interpolate_remote_entity(entity, loci._snapshot_buffer, render_time, tick_rate, (loci.netcode and loci.netcode.snap_threshold) or 50.0, now)
         end
     end
 
@@ -467,7 +475,9 @@ function loci._handle_world_state(state)
             local is_new = false
             if not ent then
                 is_new = true
-                ent = entity_mod.new_entity(entity_id, raw_ent.name)
+                ent = entity_mod.new_entity(entity_id, raw_ent.name, raw_ent.entity_type)
+            elseif raw_ent.entity_type ~= nil then
+                ent.entity_type = entity_mod.normalize_entity_type(raw_ent.entity_type) or "unknown"
             end
 
             -- Update Transform
@@ -531,8 +541,12 @@ function loci._handle_world_state(state)
     -- Despawn entities not in the new state
     for id, ent in pairs(loci.entities) do
         if not new_entities[id] then
+            if id ~= loci.my_entity_id then
+                if ent.server_x ~= nil then ent.x = ent.server_x end
+                if ent.server_y ~= nil then ent.y = ent.server_y end
+            end
             if loci.on_entity_despawned then
-                loci.on_entity_despawned(id)
+                loci.on_entity_despawned(id, ent)
             end
             loci.entities[id] = nil
             loci._entities_list_cache = nil
