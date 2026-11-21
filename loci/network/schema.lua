@@ -73,10 +73,28 @@ if love and love.system and love.system.getOS and love.system.getOS() == "Androi
     if #extra_cpaths > 0 then
         package.cpath = package.cpath .. ";" .. table.concat(extra_cpaths, ";")
     end
+    if not package.cpath:find(";lib?.so", 1, true) then
+        package.cpath = package.cpath .. ";lib?.so"
+    end
 end
 
 -- Attempt to load lua-protobuf library and protoc parser
 local ok_pb, res_pb = pcall(require, "pb")
+if not ok_pb and love and love.system and love.system.getOS and love.system.getOS() == "Android" and package and package.loadlib then
+    local loader, load_err = package.loadlib("libpb.so", "luaopen_pb")
+    if type(loader) == "function" then
+        local ok_init, mod = pcall(loader)
+        if ok_init and mod then
+            ok_pb = true
+            res_pb = mod
+            package.loaded["pb"] = mod
+        else
+            print("[Warning] luaopen_pb failed on Android: " .. tostring(mod))
+        end
+    else
+        print("[Warning] package.loadlib('libpb.so', 'luaopen_pb') failed: " .. tostring(load_err))
+    end
+end
 if ok_pb then
     pb = res_pb
     local ok_protoc, res_protoc = pcall(require, "protoc")
