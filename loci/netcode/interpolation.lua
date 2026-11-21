@@ -5,10 +5,27 @@
 
 local interpolation_module = {}
 
-function interpolation_module.interpolate_remote_entity(entity, buffer, render_time, tick_rate, snap_threshold)
+function interpolation_module.interpolate_remote_entity(entity, buffer, render_time, tick_rate, snap_threshold, now)
     buffer = buffer or {}
     local buf_len = #buffer
     snap_threshold = snap_threshold or 50.0
+    local is_projectile = (entity.entity_type == "projectile")
+
+    -- Short-lived fast projectiles skip the 50ms interpolation lag and advance
+    -- continuously from the newest authoritative snapshot to avoid initial freeze
+    -- or backward snapping when a second snapshot arrives.
+    if is_projectile and now ~= nil and buf_len >= 1 then
+        local newest = buffer[buf_len]
+        local p_new = newest.entities[entity.id]
+        if p_new then
+            local elapsed = math.max(0.0, math.min(0.100, now - newest.receive_time))
+            entity.x = p_new.x + (p_new.vx or 0) * tick_rate * elapsed
+            entity.y = p_new.y + (p_new.vy or 0) * tick_rate * elapsed
+            entity.vx = p_new.vx or 0
+            entity.vy = p_new.vy or 0
+            return
+        end
+    end
 
     if buf_len >= 2 then
         local s1, s2 = nil, nil
@@ -29,7 +46,7 @@ function interpolation_module.interpolate_remote_entity(entity, buffer, render_t
                 local dx = p2.x - p1.x
                 local dy = p2.y - p1.y
 
-                if (dx * dx + dy * dy) > (snap_threshold * snap_threshold) then
+                if (not is_projectile) and (dx * dx + dy * dy) > (snap_threshold * snap_threshold) then
                     -- Hard teleport / rubberband: snap immediately instead of sliding across map
                     if alpha >= 0.5 then
                         entity.x = p2.x
@@ -58,6 +75,16 @@ function interpolation_module.interpolate_remote_entity(entity, buffer, render_t
                 entity.y = p1.y
                 entity.vx = p1.vx or 0
                 entity.vy = p1.vy or 0
+            else
+                local newest = buffer[buf_len]
+                local p_new = newest.entities[entity.id]
+                if p_new then
+                    local elapsed = (now ~= nil) and math.max(0.0, math.min(0.100, now - newest.receive_time)) or 0.0
+                    entity.x = p_new.x + (p_new.vx or 0) * tick_rate * elapsed
+                    entity.y = p_new.y + (p_new.vy or 0) * tick_rate * elapsed
+                    entity.vx = p_new.vx or 0
+                    entity.vy = p_new.vy or 0
+                end
             end
         elseif render_time > buffer[buf_len].receive_time then
             -- Packet starvation / jitter: extrapolate slightly (up to 100ms) from newest snapshot

@@ -30,6 +30,19 @@ function entity_module.cast_property_value(val)
     return val
 end
 
+function entity_module.normalize_entity_type(raw_type)
+    if raw_type == 0 or raw_type == "PLAYER" or raw_type == "player" then
+        return "player"
+    elseif raw_type == 1 or raw_type == "NPC" or raw_type == "npc" then
+        return "npc"
+    elseif raw_type == 3 or raw_type == "PROJECTILE" or raw_type == "projectile" then
+        return "projectile"
+    elseif raw_type == 2 or raw_type == "PROP" or raw_type == "prop" then
+        return "prop"
+    end
+    return "prop"
+end
+
 -- ============================================================================
 -- High-Level Entity Abstraction
 -- ============================================================================
@@ -46,6 +59,22 @@ end
 
 function Entity:is_local_player()
     return loci_ctx ~= nil and self.id == loci_ctx.my_entity_id
+end
+
+function Entity:is_projectile()
+    return self.entity_type == "projectile"
+end
+
+function Entity:is_player()
+    return self.entity_type == "player"
+end
+
+function Entity:is_npc()
+    return self.entity_type == "npc"
+end
+
+function Entity:is_prop()
+    return self.entity_type == "prop"
 end
 
 function Entity:distance_to(other_or_pos)
@@ -67,10 +96,11 @@ end
 
 entity_module.Entity = Entity
 
-function entity_module.new_entity(id, blueprint)
+function entity_module.new_entity(id, blueprint, entity_type)
     local ent = {
         id = id,
         blueprint = blueprint,
+        entity_type = entity_module.normalize_entity_type(entity_type),
         x = 0,
         y = 0,
         vx = 0,
@@ -125,6 +155,24 @@ function entity_module.get_entities_by_blueprint(ctx, blueprint_name)
         end
     end
     return list
+end
+
+function entity_module.get_entities_by_type(ctx, type_name)
+    ctx = ctx or loci_ctx
+    if not ctx then return {} end
+    local target = entity_module.normalize_entity_type(type_name)
+    local list = {}
+    for _, e in pairs(ctx.entities) do
+        if e.entity_type == target then
+            table.insert(list, e)
+        end
+    end
+    table.sort(list, function(a, b) return (a.id or 0) < (b.id or 0) end)
+    return list
+end
+
+function entity_module.get_projectiles(ctx)
+    return entity_module.get_entities_by_type(ctx, "projectile")
 end
 
 function entity_module.get_entities_in_radius(ctx, center_x, center_y, radius)
