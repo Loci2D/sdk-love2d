@@ -40,7 +40,7 @@ function entity_module.normalize_entity_type(raw_type)
     elseif raw_type == 2 or raw_type == "PROP" or raw_type == "prop" then
         return "prop"
     end
-    return "prop"
+    return nil
 end
 
 -- ============================================================================
@@ -100,7 +100,7 @@ function entity_module.new_entity(id, blueprint, entity_type)
     local ent = {
         id = id,
         blueprint = blueprint,
-        entity_type = entity_module.normalize_entity_type(entity_type),
+        entity_type = entity_module.normalize_entity_type(entity_type) or (entity_type == nil and "prop" or "unknown"),
         x = 0,
         y = 0,
         vx = 0,
@@ -161,6 +161,7 @@ function entity_module.get_entities_by_type(ctx, type_name)
     ctx = ctx or loci_ctx
     if not ctx then return {} end
     local target = entity_module.normalize_entity_type(type_name)
+    if not target then return {} end
     local list = {}
     for _, e in pairs(ctx.entities) do
         if e.entity_type == target then

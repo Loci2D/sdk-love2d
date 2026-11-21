@@ -476,9 +476,8 @@ function loci._handle_world_state(state)
             if not ent then
                 is_new = true
                 ent = entity_mod.new_entity(entity_id, raw_ent.name, raw_ent.entity_type)
-                ent._spawn_time = now
             elseif raw_ent.entity_type ~= nil then
-                ent.entity_type = entity_mod.normalize_entity_type(raw_ent.entity_type)
+                ent.entity_type = entity_mod.normalize_entity_type(raw_ent.entity_type) or "unknown"
             end
 
             -- Update Transform
@@ -542,8 +541,10 @@ function loci._handle_world_state(state)
     -- Despawn entities not in the new state
     for id, ent in pairs(loci.entities) do
         if not new_entities[id] then
-            if ent.server_x ~= nil then ent.x = ent.server_x end
-            if ent.server_y ~= nil then ent.y = ent.server_y end
+            if id ~= loci.my_entity_id then
+                if ent.server_x ~= nil then ent.x = ent.server_x end
+                if ent.server_y ~= nil then ent.y = ent.server_y end
+            end
             if loci.on_entity_despawned then
                 loci.on_entity_despawned(id, ent)
             end
