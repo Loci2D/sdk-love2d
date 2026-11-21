@@ -100,15 +100,17 @@ if ok_pb then
     local ok_protoc, res_protoc = pcall(require, "protoc")
     if ok_protoc then
         protoc = res_protoc
+    else
+        print("[Warning] 'protoc' module failed to load: " .. tostring(res_protoc))
     end
 else
     print("[Warning] 'lua-protobuf' module not found.")
     print("Install lua-protobuf (e.g. via luarocks install lua-protobuf) to run full binary Protobuf encoding.")
 end
 
-local function read_proto_file(path)
+local function read_proto_file(path, binary)
     if not path then return nil end
-    local f = io.open(path, "r")
+    local f = io.open(path, binary and "rb" or "r")
     if f then
         local content = f:read("*a")
         f:close()
@@ -164,18 +166,20 @@ function schema_module.load(base_path)
         }
 
         for _, path in ipairs(candidate_proto_paths) do
-            local content = read_proto_file(path)
+            local content = read_proto_file(path, false)
             if content then
-                local ok, _ = pcall(function() return p:load(content, "game_packets.proto") end)
+                local ok, err = pcall(function() return p:load(content, "game_packets.proto") end)
                 if ok then
                     schema_loaded = true
                     break
+                else
+                    print("[Warning] protoc:load failed for " .. tostring(path) .. ": " .. tostring(err))
                 end
             end
         end
     end
 
-    -- 2. Fallback: try loading compiled .pb descriptor file
+    -- 2. Fallback: try loading compiled .pb descriptor file (supports Love2D VFS via pb.load)
     if not schema_loaded then
         local candidate_pb_paths = {
             base_path and (base_path .. "game_packets.pb"),
@@ -192,6 +196,14 @@ function schema_module.load(base_path)
             "game_packets.pb",
         }
         for _, path in ipairs(candidate_pb_paths) do
+            local content = read_proto_file(path, true)
+            if content and pb.load then
+                local ok, res = pcall(pb.load, content)
+                if ok and res then
+                    schema_loaded = true
+                    break
+                end
+            end
             local ok, res = pcall(function() return pb.loadfile(path) end)
             if ok and res then
                 schema_loaded = true
