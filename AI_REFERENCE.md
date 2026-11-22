@@ -19,6 +19,9 @@
 
 ### 2. State Access
 - `loci.get_entities()`: Returns a table of all entities currently visible to the client.
+- `loci.get_entities_by_blueprint(blueprint_name)`: Filters active entities by blueprint name.
+- `loci.get_entities_by_type(entity_type)`: Filters active entities by normalized type (`"player"`, `"npc"`, `"prop"`, `"projectile"`), sorted by `id`.
+- `loci.get_projectiles()`: Convenience helper returning all active projectile entities (`entity:is_projectile()`), sorted by `id`.
 - `loci.get_my_entity()`: Returns the local player's `Entity` object.
 - `loci.get_globals()`: Returns a table of global match properties (e.g., scores, timers).
 - `loci.get_entities_in_radius(center_x, center_y, radius)`: Spatial query helper.
@@ -31,10 +34,11 @@
 ### 3. The `Entity` Object
 Entities are NOT simple tables. They have a metatable that automatically casts properties.
 - **Transform**: `entity.x`, `entity.y`, `entity.vx`, `entity.vy` (all floats).
-- **Metadata**: `entity.id`, `entity.blueprint` (string).
+- **Metadata**: `entity.id`, `entity.blueprint` (string), `entity.entity_type` (`"player"`, `"npc"`, `"prop"`, or `"projectile"`).
 - **Dynamic Properties**: Accessed directly via `entity.prop_name` (e.g., `entity.hp`, `entity.team`). Values are automatically cast to `number` or `boolean`.
 - **Methods**: 
   - `entity:is_local_player()` -> bool
+  - `entity:is_projectile()` / `entity:is_player()` / `entity:is_npc()` / `entity:is_prop()` -> bool
   - `entity:distance_to(other_entity_or_table)` -> number
 
 ### 3b. The `Obstacle` Object
@@ -57,7 +61,7 @@ Static obstacles (`wall`, destructible `crate`, `trigger` zone) also use an auto
 ### 5. Event Callbacks (Server -> Client)
 The developer must assign functions to these callbacks to react to server events:
 - `loci.on_entity_spawned = function(entity)`
-- `loci.on_entity_despawned = function(entity_id)`
+- `loci.on_entity_despawned = function(entity_id, last_entity)`: `last_entity` carries the final authoritative `x, y` and metadata for impact VFX/SFX.
 - `loci.on_property_changed = function(entity, key, old_val, new_val)`: Ideal for updating UI or VFX.
 - `loci.on_obstacle_spawned = function(obstacle)`
 - `loci.on_obstacle_destroyed = function(obstacle_id, last_obstacle)`: Ideal for crate destruction VFX/SFX.
@@ -90,3 +94,4 @@ Zero-GC telemetry monitoring for RTT, RFC 3550 Jitter, Packet Loss %, and Tick F
 ### 7. Server-side scripting tips
 - **Dash ability:** To implement a dash ability that passes through enemies but stops at walls, the server script should use `Loci.Physics.raycast` to find walls and `Loci.Commands.set_collision_filter` to temporarily ignore entities. Always remember to restore the original collision filter!
 - **Walls, crates & trigger zones:** Spawn static geometry from `on_init` via `Loci.Commands.spawn_static_obstacle({ blueprint = "crate", position = { x = 10, y = 0 }, width = 4, height = 4, collision_type = "destructible", properties = { hp = 2 } })`. Client prediction automatically resolves against solid obstacles (`obs.is_solid == true`).
+- **Physical projectiles:** Spawn projectiles with `Loci.Commands.spawn_entity({ blueprint = "fireball", entity_type = "Projectile", position = pos, velocity = { x = dir_x * 15, y = dir_y * 15 }, radius = 1.0, lifetime_ticks = 30 })`. Projectiles use swept CCD (anti-tunneling), sensor collision (`on_collision` without pushing targets), and notify `on_static_collision(entity_id, obstacle_id, nx, ny)` and `on_boundary_collision(entity_id, nx, ny)` for destruction or ricochet reflection.
