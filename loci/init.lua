@@ -24,7 +24,7 @@ local exporter_mod = require(prefix .. "telemetry.exporter")
 
 local loci = {
     -- Metadata
-    VERSION = "0.6.6",
+    VERSION = "0.6.7",
     COMPATIBLE_ENGINE_VERSION = "0.6.x",
     SCHEMA_VERSION = 1,
     entities = {},
