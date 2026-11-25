@@ -546,7 +546,10 @@ function loci._handle_world_state(state)
                 if ent.server_y ~= nil then ent.y = ent.server_y end
             end
             if loci.on_entity_despawned then
-                loci.on_entity_despawned(id, ent)
+                local ok, err = pcall(loci.on_entity_despawned, id, ent)
+                if not ok then
+                    print("[Warning] on_entity_despawned callback error for entity " .. tostring(id) .. ": " .. tostring(err))
+                end
             end
             loci.entities[id] = nil
             loci._entities_list_cache = nil
