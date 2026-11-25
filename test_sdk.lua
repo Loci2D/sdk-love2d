@@ -1615,11 +1615,93 @@ else
     print("[SKIPPED] Section 10.3 binary protobuf roundtrip (pb.so not loaded in pure-Lua fallback pass)")
 end
 
+-- 10.4 Defensive pcall around on_entity_despawned prevents snapshot ingestion from aborting
+loci.entities = {}
+loci._entities_list_cache = nil
+loci.obstacles = {}
+loci._obstacles_list_cache = nil
+loci._snapshot_buffer = {}
+loci.my_entity_id = 710
+
+loci._handle_world_state({
+    tick = 710,
+    _receive_time = 6000.000,
+    entities = {
+        { id = 710, name = "LocalPlayer", entity_type = 0, position = { x_bits = 0, y_bits = 0 }, velocity = { x_bits = 0, y_bits = 0 } },
+        { id = 960, name = "faulty_bolt", entity_type = 3, position = { x_bits = 1 * 65536, y_bits = 0 }, velocity = { x_bits = 0, y_bits = 0 } },
+        { id = 961, name = "sibling_bolt", entity_type = 3, position = { x_bits = 2 * 65536, y_bits = 0 }, velocity = { x_bits = 0, y_bits = 0 } }
+    }
+})
+assert(loci.my_entity_id == 710, "my_entity_id must be 710 before despawn regression check")
+
+local despawn_calls_10_4 = {}
+local captured_warnings_10_4 = {}
+local orig_print_10_4 = _G.print
+_G.print = function(...)
+    local parts = {}
+    for i = 1, select("#", ...) do
+        parts[i] = tostring(select(i, ...))
+    end
+    table.insert(captured_warnings_10_4, table.concat(parts, "\t"))
+end
+
+loci.on_entity_despawned = function(id, ent)
+    despawn_calls_10_4[id] = ent
+    if id == 960 or id == 710 then
+        error("simulated VFX callback failure")
+    end
+end
+
+local ok_ingest_10_4, ingest_err_10_4 = pcall(loci._handle_world_state, {
+    tick = 711,
+    _receive_time = 6000.033,
+    entities = {},
+    obstacles = {
+        {
+            id = 501,
+            blueprint = "wall",
+            is_solid = true,
+            collision_type = "solid",
+            shape_type = 0,
+            x_bits = 5 * 65536,
+            y_bits = 5 * 65536,
+            width_bits = 2 * 65536,
+            height_bits = 2 * 65536
+        }
+    }
+})
+_G.print = orig_print_10_4
+
+assert(ok_ingest_10_4, "on_entity_despawned error must not abort _handle_world_state: " .. tostring(ingest_err_10_4))
+assert(despawn_calls_10_4[960] ~= nil and despawn_calls_10_4[961] ~= nil and despawn_calls_10_4[710] ~= nil,
+    "All despawned entities must invoke on_entity_despawned even when an earlier callback throws")
+assert(loci.entities[960] == nil and loci.entities[961] == nil and loci.entities[710] == nil,
+    "All despawned entities must be removed from loci.entities despite callback errors")
+assert(#loci.get_entities() == 0, "_entities_list_cache must be invalidated despite callback errors")
+assert(loci.my_entity_id == nil, "my_entity_id must be cleared when local entity despawns even if callback throws")
+assert(loci.get_obstacle(501) ~= nil, "Downstream obstacle ingestion must still execute after despawn callback errors")
+assert(loci._snapshot_buffer[#loci._snapshot_buffer] and loci._snapshot_buffer[#loci._snapshot_buffer].tick == 711,
+    "Downstream snapshot buffer recording must still execute after despawn callback errors")
+
+local found_warning_10_4 = false
+for _, msg in ipairs(captured_warnings_10_4) do
+    if msg:find("%[Warning%] on_entity_despawned callback error", 1, false)
+        and msg:find("simulated VFX callback failure", 1, true) then
+        found_warning_10_4 = true
+        break
+    end
+end
+assert(found_warning_10_4, "Expected [Warning] log for on_entity_despawned callback failure")
+
 -- Cleanup Section 10
 loci.on_entity_spawned = orig_spawned_10
 loci.on_entity_despawned = orig_despawned_10
 loci.on_match_state_changed = orig_match_state_10
 loci.entities = {}
+loci._entities_list_cache = nil
+loci.obstacles = {}
+loci._obstacles_list_cache = nil
+loci.my_entity_id = nil
 loci._snapshot_buffer = {}
 loci._mock_time = nil
 
